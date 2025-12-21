@@ -137,21 +137,44 @@ pub async fn p2p_handshake(
     // not necessary when relay_mode is true, but UDP is connectionless
     socket.connect(device).await.unwrap();
 
-    socket2.connect(MAIN_SERVER).await.unwrap();
+    let max_retries = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        debug!(
+            "Setting up relay channel (attempt {}/{})...",
+            attempt, max_retries
+        );
 
-    debug!("Setting up relay channel...");
-    socket2
-        .dh_request(
-            format!("/device/{}/relay-channel", serial).as_ref(),
-            Some(format!("<body><agentAddr>{}</agentAddr></body>", agent).as_ref()),
-            &mut cseq,
-        )
-        .await;
+        // Send the relay-channel request via the main server
+        socket2.connect(MAIN_SERVER).await.unwrap();
+        socket2
+            .dh_request(
+                format!("/device/{}/relay-channel", serial).as_ref(),
+                Some(format!("<body><agentAddr>{}</agentAddr></body>", agent).as_ref()),
+                &mut cseq,
+            )
+            .await;
 
-    socket2.connect(agent).await.unwrap();
-    debug!("Waiting for relay channel confirmation...");
-    socket2.dh_read().await;
-    debug!("Relay channel ready");
+        // Switch to the agent to await the confirmation
+        socket2.connect(agent).await.unwrap();
+        debug!("Waiting for relay channel confirmation...");
+
+        match time::timeout(time::Duration::from_millis(1500), socket2.dh_read()).await {
+            Ok(_) => {
+                debug!("Relay channel ready");
+                info!("Relay channel established; starting PTCP handshake");
+                break;
+            }
+            Err(_) => {
+                warn!("Timed out waiting for relay channel confirmation (attempt {})", attempt);
+                if attempt >= max_retries {
+                    error!("Failed to confirm relay channel after {} attempts", max_retries);
+                    panic!("Relay channel confirmation timed out");
+                }
+            }
+        }
+    }
 
     info!("Initiating PTCP session...");
     let mut session = PTCPSession::new();

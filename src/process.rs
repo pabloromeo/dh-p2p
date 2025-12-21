@@ -1,4 +1,4 @@
-use log::warn;
+use log::{info, warn};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -127,6 +127,7 @@ pub async fn dh_reader(
         match packet.body {
             PTCPBody::Status(realm, status) => {
                 if status == "CONN" {
+                    info!("Realm {:08x} streaming ready", realm);
                     conn_channels
                         .lock()
                         .unwrap()
