@@ -1,3 +1,4 @@
+use log::warn;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ pub async fn process_writer(
     loop {
         let data = rx.recv().await.unwrap();
         if writer.write_all(&data).await.is_err() {
-            println!("Writer: Socket closed by peer.");
+            warn!("Writer: Socket closed by peer.");
             break;
         }
     }
@@ -40,7 +41,7 @@ pub async fn process_reader(
         let n = match reader.read(&mut buf).await {
             Ok(n) => {
                 if n == 0 {
-                    println!("Reader: Socket closed by peer.");
+                    warn!("Reader: Socket closed by peer.");
                     dh_tx.send(PTCPEvent::Disconnect(realm_id)).await.unwrap();
                     break;
                 }
@@ -48,7 +49,7 @@ pub async fn process_reader(
                 n
             }
             Err(e) => {
-                println!("Reader: {}", e);
+                warn!("Reader: {}", e);
                 dh_tx.send(PTCPEvent::Disconnect(realm_id)).await.unwrap();
                 break;
             }
@@ -139,7 +140,7 @@ pub async fn dh_reader(
                 let tx = channels.lock().unwrap().get(&p.realm).unwrap().clone();
 
                 if tx.send(p.data).await.is_err() {
-                    println!("Realm {:08x} unavailable", p.realm);
+                    warn!("Realm {:08x} unavailable", p.realm);
                 }
             }
             _ => {}

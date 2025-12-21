@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use log::{debug, trace};
 use std::cmp;
 use tokio::net::UdpSocket;
 
@@ -224,7 +225,7 @@ impl PTCPPacket {
     fn try_print_data(&self) {
         if let PTCPBody::Payload(p) = &self.body {
             if p.data.len() > 4 && p.data.iter().all(|b| *b < 0x80) {
-                println!("{}", String::from_utf8_lossy(&p.data));
+                trace!("{}", String::from_utf8_lossy(&p.data));
             }
         }
     }
@@ -301,26 +302,26 @@ pub trait PTCP {
 #[async_trait]
 impl PTCP for UdpSocket {
     async fn ptcp_request(&self, packet: PTCPPacket) {
-        println!(">>> {}", self.peer_addr().unwrap());
-        println!("{:?}", packet);
+        debug!(">>> {} {:?}", self.peer_addr().unwrap(), packet.body);
+        trace!("{:?}", packet);
         packet.try_print_data();
-        println!("---");
+        trace!("---");
 
         let packet = packet.serialize();
         self.send(&packet).await.unwrap();
     }
 
     async fn ptcp_read(&self) -> PTCPPacket {
-        println!("### {}", self.peer_addr().unwrap());
+        trace!("### {}", self.peer_addr().unwrap());
 
         let mut buf = [0u8; 4096];
         let n = self.recv(&mut buf).await.unwrap();
 
-        println!("<<< {}", self.peer_addr().unwrap());
         let packet = PTCPPacket::parse(&buf[0..n]);
-        println!("{:?}", packet);
+        debug!("<<< {} {:?}", self.peer_addr().unwrap(), packet.body);
+        trace!("{:?}", packet);
         packet.try_print_data();
-        println!("---");
+        trace!("---");
 
         packet
     }

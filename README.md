@@ -37,8 +37,28 @@ Arguments:
 Options:
   -p, --port <[bind_address:]port:remote_port>
           Bind address, port and remote port. Default: 127.0.0.1:1554:554
+  -r, --relay
+          Relay mode (experimental)
+  -v, --verbose...
+          Increase verbosity (-v for debug, -vv for trace)
   -h, --help
           Print help
+```
+
+### Logging
+
+The application supports configurable log levels via the `-v` flag:
+
+| Flag | Level | Description |
+|------|-------|-------------|
+| (none) | INFO | User-facing messages only (session status, connections) |
+| `-v` | DEBUG | Protocol flow (requests, responses, packet types) |
+| `-vv` | TRACE | Full wire-level details (raw bytes, packet dumps) |
+
+You can also use the `RUST_LOG` environment variable for fine-grained control:
+
+```bash
+RUST_LOG=trace ./dh-p2p YOUR_SERIAL
 ```
 
 ## Python implementation

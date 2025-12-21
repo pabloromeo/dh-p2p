@@ -1,4 +1,5 @@
 use clap::Parser;
+use log::{debug, info};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -27,6 +28,9 @@ struct Cli {
     /// Relay mode (experimental)
     #[arg(short, long)]
     relay: bool,
+    /// Increase verbosity (-v for debug, -vv for trace)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Serial number of the camera
     serial: String,
 }
@@ -34,6 +38,20 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let args = Cli::parse();
+
+    // Initialize logger based on verbosity level
+    let log_level = match args.verbose {
+        0 => log::LevelFilter::Info,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
+    };
+    env_logger::Builder::new()
+        .filter_level(log_level)
+        .format_target(false)
+        .format_timestamp_secs()
+        .init();
+
+    debug!("Log level set to {:?}", log_level);
 
     let serial = args.serial;
     let port = args.port.unwrap_or("127.0.0.1:1554:554".to_string());
@@ -68,7 +86,7 @@ async fn main() {
     let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
 
-    println!("PTCP session established");
+    info!("PTCP session established");
 
     /*
      * Clone the handles
@@ -97,9 +115,9 @@ async fn main() {
         dh_reader(session2, reader, channels, conn_channels).await;
     });
 
-    println!("Ready to connect!");
+    info!("Ready to connect!");
     if remote_port == 554 {
-        println!(
+        info!(
             "RTSP URL: rtsp://127.0.0.1{}/cam/realmonitor?channel=1&subtype=0",
             if bind_port != 554 {
                 format!(":{}", bind_port)
@@ -112,7 +130,7 @@ async fn main() {
     loop {
         // The second item contains the IP and port of the new connection.
         let (client, addr) = listener.accept().await.unwrap();
-        println!("Accepted connection from {}", addr);
+        info!("Accepted connection from {}", addr);
 
         // Create a channel for the client
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);

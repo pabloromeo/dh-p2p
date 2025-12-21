@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine;
+use log::{debug, error, info, trace, warn};
 use sha1::Digest;
 use std::{collections::HashMap, net::SocketAddrV4};
 use tokio::{net::UdpSocket, time};
@@ -31,6 +32,7 @@ pub async fn p2p_handshake(
 ) -> (UdpSocket, PTCPSession) {
     let mut cseq = 0;
 
+    info!("Connecting to P2P service...");
     socket.connect(MAIN_SERVER).await.unwrap();
 
     socket.dh_request("/probe/p2psrv", None, &mut cseq).await;
@@ -48,6 +50,7 @@ pub async fn p2p_handshake(
     socket.dh_request("/online/relay", None, &mut cseq).await;
     let relay = &socket.dh_read().await.body.unwrap()["body/Address"];
 
+    info!("Probing device {}...", serial);
     let socket2 = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     socket2.connect(p2psrv).await.unwrap();
 
@@ -86,15 +89,19 @@ pub async fn p2p_handshake(
         )
         .await;
 
+    info!("Setting up relay connection...");
     socket2.connect(relay).await.unwrap();
 
+    debug!("Requesting relay agent...");
     socket2.dh_request("/relay/agent", None, &mut cseq).await;
     let data = socket2.dh_read().await.body.unwrap();
     let token = &data["body/Token"];
     let agent = &data["body/Agent"];
+    debug!("Got agent: {}", agent);
 
     socket2.connect(agent).await.unwrap();
 
+    debug!("Starting relay...");
     socket2
         .dh_request(
             format!("/relay/start/{}", token).as_ref(),
@@ -103,21 +110,25 @@ pub async fn p2p_handshake(
         )
         .await;
     socket2.dh_read().await;
+    debug!("Relay started");
 
+    debug!("Waiting for device channel response...");
     let mut res = socket.dh_read_raw().await;
 
     if res.code == 100 {
+        debug!("Got 100 Continue, waiting for final response...");
         res = socket.dh_read_raw().await;
     }
 
     if res.code >= 400 {
         if res.code == 403 {
-            println!("Device requires authentication when creating P2P channel.");
-            println!("Authentication is not supported at this time.");
+            error!("Device requires authentication when creating P2P channel.");
+            error!("Authentication is not supported at this time.");
         }
 
         panic!("Error response: {}", res.status);
     }
+    debug!("Got device info (code {})", res.code);
 
     let data = res.body.unwrap();
     let device_laddr = &data["body/LocalAddr"];
@@ -128,6 +139,7 @@ pub async fn p2p_handshake(
 
     socket2.connect(MAIN_SERVER).await.unwrap();
 
+    debug!("Setting up relay channel...");
     socket2
         .dh_request(
             format!("/device/{}/relay-channel", serial).as_ref(),
@@ -137,15 +149,18 @@ pub async fn p2p_handshake(
         .await;
 
     socket2.connect(agent).await.unwrap();
-    // TODO check timeout
+    debug!("Waiting for relay channel confirmation...");
     socket2.dh_read().await;
+    debug!("Relay channel ready");
 
+    info!("Initiating PTCP session...");
     let mut session = PTCPSession::new();
 
     socket2.ptcp_request(session.send(PTCPBody::Sync)).await;
     session.recv(socket2.ptcp_read().await);
 
     if relay_mode {
+        info!("Relay mode enabled");
         return (socket2, session);
     }
 
@@ -165,7 +180,7 @@ pub async fn p2p_handshake(
         _ => panic!("Invalid response"),
     };
 
-    println!(
+    trace!(
         "Sign: {}",
         sign.iter()
             .map(|b| format!("{:02x}", b))
@@ -173,11 +188,12 @@ pub async fn p2p_handshake(
             .join("")
     );
 
+    info!("Establishing direct P2P connection...");
     let cookie: [u8; 4] = rand::random();
     let trans_id: [u8; 12] = rand::random();
     let cid: Vec<u8> = cid.iter().map(|b| !b).collect();
 
-    println!(">>> {}", socket.peer_addr().unwrap());
+    trace!(">>> {}", socket.peer_addr().unwrap());
     let data = [
         b"\xff\xfe\xff\xe7".to_vec(),
         cookie.to_vec(),
@@ -188,7 +204,7 @@ pub async fn p2p_handshake(
         ip_to_bytes(&device),
     ]
     .concat();
-    println!(
+    trace!(
         "Raw [{}]",
         data.iter()
             .map(|b| format!("{:02x}", b))
@@ -196,23 +212,23 @@ pub async fn p2p_handshake(
             .join(" ")
     );
     socket.send(&data).await.unwrap();
-    println!("---");
+    trace!("---");
 
-    println!("<<< {}", socket.peer_addr().unwrap());
+    trace!("<<< {}", socket.peer_addr().unwrap());
     let mut buf = [0u8; 4096];
 
     let result = time::timeout(time::Duration::from_secs(5), socket.recv(&mut buf)).await;
 
     if result.is_err() {
-        println!("Timeout occurred while waiting for a response from the device.");
-        println!(
+        warn!("Timeout occurred while waiting for a response from the device.");
+        warn!(
             "If the issue persists, you may need to use relay mode (--relay) with this device."
         );
         panic!("Timeout");
     }
 
     let n = result.unwrap().unwrap();
-    println!(
+    trace!(
         "Raw [{}]",
         buf[0..n]
             .iter()
@@ -220,11 +236,11 @@ pub async fn p2p_handshake(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    println!("---");
+    trace!("---");
 
     let rtrans_id = &buf[8..20];
 
-    println!(">>> {}", socket.peer_addr().unwrap());
+    trace!(">>> {}", socket.peer_addr().unwrap());
     let data = [
         b"\xfe\xfe\xff\xe7".to_vec(),
         cookie.to_vec(),
@@ -235,7 +251,7 @@ pub async fn p2p_handshake(
         ip_to_bytes(&device_laddr),
     ]
     .concat();
-    println!(
+    trace!(
         "Raw [{}]",
         data.iter()
             .map(|b| format!("{:02x}", b))
@@ -243,13 +259,13 @@ pub async fn p2p_handshake(
             .join(" ")
     );
     socket.send(&data).await.unwrap();
-    println!("---");
+    trace!("---");
 
     // read 5 times
     for _ in 0..5 {
-        println!("<<< {}", socket.peer_addr().unwrap());
+        trace!("<<< {}", socket.peer_addr().unwrap());
         let n = socket.recv(&mut buf).await.unwrap();
-        println!(
+        trace!(
             "Raw [{}]",
             buf[0..n]
                 .iter()
@@ -257,7 +273,7 @@ pub async fn p2p_handshake(
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        println!("---");
+        trace!("---");
     }
 
     let mut session = PTCPSession::new();
@@ -298,6 +314,7 @@ pub async fn p2p_handshake(
 
     assert!(matches!(res.body, PTCPBody::Empty), "Invalid response");
 
+    info!("P2P handshake complete");
     (socket, session)
 }
 
@@ -425,26 +442,26 @@ impl DHP2P for UdpSocket {
             method, path, seq, USERNAME, digest, nonce, currdate, body,
         );
 
-        println!(">>> {}", self.peer_addr().unwrap());
-        println!("{}", req);
-        println!("---");
+        debug!(">>> {} {}", self.peer_addr().unwrap(), path);
+        trace!("{}", req);
+        trace!("---");
 
         self.send(req.as_bytes()).await.unwrap();
     }
 
     async fn dh_read_raw(&self) -> DHResponse {
-        println!("### {}", self.peer_addr().unwrap());
+        trace!("### {}", self.peer_addr().unwrap());
 
         let mut buf = [0u8; 4096];
         let n = self.recv(&mut buf).await.unwrap();
         let res = String::from_utf8_lossy(&buf[0..n]);
 
-        println!("<<< {}", self.peer_addr().unwrap());
-        println!("{}", res);
-        println!("---");
+        trace!("<<< {}", self.peer_addr().unwrap());
+        trace!("{}", res);
+        trace!("---");
 
         let res = DHResponse::parse_response(&res);
-        println!("{:?}", res);
+        debug!("<<< {} {} {}", self.peer_addr().unwrap(), res.code, res.status);
 
         res
     }
