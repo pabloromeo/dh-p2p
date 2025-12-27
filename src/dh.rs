@@ -137,7 +137,7 @@ pub async fn p2p_handshake(
     // not necessary when relay_mode is true, but UDP is connectionless
     socket.connect(device).await.unwrap();
 
-    let max_retries = 3;
+    let max_retries = 5;
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -160,7 +160,7 @@ pub async fn p2p_handshake(
         socket2.connect(agent).await.unwrap();
         debug!("Waiting for relay channel confirmation...");
 
-        match time::timeout(time::Duration::from_millis(1500), socket2.dh_read()).await {
+        match time::timeout(time::Duration::from_millis(500), socket2.dh_read()).await {
             Ok(_) => {
                 debug!("Relay channel ready");
                 info!("Relay channel established; starting PTCP handshake");
