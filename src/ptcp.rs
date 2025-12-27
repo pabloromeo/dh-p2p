@@ -283,6 +283,9 @@ impl PTCPSession {
     }
 
     pub fn recv(&mut self, packet: PTCPPacket) -> PTCPPacket {
+        // Original implementation
+        //self.recv += packet.body.len() as u32;
+
         // Instead of tracking our own recv counter, just trust the device's sent counter.
         // This ensures we always report receiving exactly what the device claims to have sent,
         // avoiding any counter mismatch that might cause the device to close the connection.
