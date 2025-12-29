@@ -18,7 +18,7 @@ RUN cargo build --release
 FROM debian:bullseye-slim AS runtime
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates tini \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -30,7 +30,8 @@ ENV RUST_LOG=info
 # Default listener port (change with -p/--port)
 EXPOSE 1554/tcp
 
-ENTRYPOINT ["dh-p2p"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "dh-p2p"]
 # Show CLI help if no args are provided. Override with runtime args, e.g.:
 # docker run --rm -p 1554:1554 ghcr.io/you/dh-p2p <SERIAL> -p 0.0.0.0:1554:554 -v
 CMD ["--help"]
