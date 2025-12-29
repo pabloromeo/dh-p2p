@@ -8,12 +8,12 @@ WORKDIR /app
 
 # Cache dependencies
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "// dummy" > src/lib.rs
-RUN cargo fetch
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
+RUN cargo fetch --locked
 
 # Build
 COPY src ./src
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bullseye-slim AS runtime
 
