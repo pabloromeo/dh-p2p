@@ -45,6 +45,14 @@ Options:
           Print help
 ```
 
+### Graceful shutdown
+
+The Rust server handles `SIGTERM`/`SIGINT` (Ctrl+C). On shutdown it:
+- Stops accepting new TCP clients and lets heartbeat/IO tasks exit via a shared shutdown signal.
+- Sends a PTCP `DISC` status to every active realm before closing channels so devices can tear down cleanly.
+
+This makes it friendlier for containers/orchestrators (e.g., Kubernetes rolling updates) by reducing dropped connections during termination.
+
 ### Logging
 
 The application supports configurable log levels via the `-v` flag:

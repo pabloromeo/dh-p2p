@@ -167,9 +167,15 @@ pub async fn p2p_handshake(
                 break;
             }
             Err(_) => {
-                warn!("Timed out waiting for relay channel confirmation (attempt {})", attempt);
+                warn!(
+                    "Timed out waiting for relay channel confirmation (attempt {})",
+                    attempt
+                );
                 if attempt >= max_retries {
-                    error!("Failed to confirm relay channel after {} attempts", max_retries);
+                    error!(
+                        "Failed to confirm relay channel after {} attempts",
+                        max_retries
+                    );
                     panic!("Relay channel confirmation timed out");
                 }
             }
@@ -244,9 +250,7 @@ pub async fn p2p_handshake(
 
     if result.is_err() {
         warn!("Timeout occurred while waiting for a response from the device.");
-        warn!(
-            "If the issue persists, you may need to use relay mode (--relay) with this device."
-        );
+        warn!("If the issue persists, you may need to use relay mode (--relay) with this device.");
         panic!("Timeout");
     }
 
@@ -484,7 +488,12 @@ impl DHP2P for UdpSocket {
         trace!("---");
 
         let res = DHResponse::parse_response(&res);
-        debug!("<<< {} {} {}", self.peer_addr().unwrap(), res.code, res.status);
+        debug!(
+            "<<< {} {} {}",
+            self.peer_addr().unwrap(),
+            res.code,
+            res.status
+        );
 
         res
     }

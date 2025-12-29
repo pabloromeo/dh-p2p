@@ -6,7 +6,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
 };
 
 use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
@@ -17,12 +17,22 @@ use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
 pub async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<Vec<u8>>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let data = rx.recv().await.unwrap();
-        if writer.write_all(&data).await.is_err() {
-            warn!("Writer: Socket closed by peer.");
-            break;
+        tokio::select! {
+            data = rx.recv() => {
+                match data {
+                    Some(data) => {
+                        if writer.write_all(&data).await.is_err() {
+                            warn!("Writer: Socket closed by peer.");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = shutdown.changed() => break,
         }
     }
 }
@@ -34,31 +44,40 @@ pub async fn process_reader(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     realm_id: u32,
     dh_tx: mpsc::Sender<PTCPEvent>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let mut buf = [0u8; 4096];
 
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(n) => {
-                if n == 0 {
-                    warn!("Reader: Socket closed by peer.");
-                    dh_tx.send(PTCPEvent::Disconnect(realm_id)).await.unwrap();
-                    break;
-                }
+        let n = tokio::select! {
+            res = reader.read(&mut buf) => {
+                match res {
+                    Ok(n) => {
+                        if n == 0 {
+                            warn!("Reader: Socket closed by peer.");
+                            let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
+                            break;
+                        }
 
-                n
+                        n
+                    }
+                    Err(e) => {
+                        warn!("Reader: {}", e);
+                        let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
+                        break;
+                    }
+                }
             }
-            Err(e) => {
-                warn!("Reader: {}", e);
-                dh_tx.send(PTCPEvent::Disconnect(realm_id)).await.unwrap();
-                break;
-            }
+            _ = shutdown.changed() => break,
         };
 
-        dh_tx
+        if dh_tx
             .send(PTCPEvent::Data(realm_id, buf[0..n].to_vec()))
             .await
-            .unwrap();
+            .is_err()
+        {
+            break;
+        }
     }
 }
 
@@ -70,9 +89,15 @@ pub async fn dh_writer(
     socket: Arc<UdpSocket>,
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let ev = dh_rx.recv().await.unwrap();
+        let ev = tokio::select! {
+            ev = dh_rx.recv() => ev,
+            _ = shutdown.changed() => None,
+        };
+
+        let Some(ev) = ev else { break };
 
         match ev {
             PTCPEvent::Heartbeat => {
@@ -112,9 +137,13 @@ pub async fn dh_reader(
     socket: Arc<UdpSocket>,
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let packet = socket.ptcp_read().await;
+        let packet = tokio::select! {
+            packet = socket.ptcp_read() => packet,
+            _ = shutdown.changed() => break,
+        };
         let packet = session.lock().unwrap().recv(packet);
 
         if let PTCPBody::Empty = packet.body {
