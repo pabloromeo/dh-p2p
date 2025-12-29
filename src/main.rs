@@ -127,8 +127,19 @@ async fn main() {
     });
 
     let writer_shutdown = shutdown_rx.clone();
+    let writer_channels = Arc::clone(&channels2);
+    let writer_conn_channels = Arc::clone(&conn_channels2);
     let writer_handle = tokio::spawn(async move {
-        dh_writer(session, writer, dh_rx, remote_port.into(), writer_shutdown).await;
+        dh_writer(
+            session,
+            writer,
+            dh_rx,
+            remote_port.into(),
+            writer_shutdown,
+            writer_channels,
+            writer_conn_channels,
+        )
+        .await;
     });
 
     let reader_shutdown = shutdown_rx.clone();
@@ -200,14 +211,18 @@ async fn main() {
 
         let (reader, writer) = client.into_split();
 
-        let reader_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            process_reader(reader, realm_id, dh_tx, reader_shutdown).await;
+        tokio::spawn({
+            let shutdown_rx = shutdown_rx.clone();
+            async move {
+                process_reader(reader, realm_id, dh_tx, shutdown_rx).await;
+            }
         });
 
-        let writer_shutdown = shutdown_rx.clone();
-        tokio::spawn(async move {
-            process_writer(writer, rx, writer_shutdown).await;
+        tokio::spawn({
+            let shutdown_rx = shutdown_rx.clone();
+            async move {
+                process_writer(writer, rx, shutdown_rx).await;
+            }
         });
     }
 

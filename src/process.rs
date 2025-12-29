@@ -90,6 +90,8 @@ pub async fn dh_writer(
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
     mut shutdown: watch::Receiver<bool>,
+    channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 ) {
     loop {
         let ev = tokio::select! {
@@ -117,6 +119,8 @@ pub async fn dh_writer(
                     .unwrap()
                     .send(PTCPBody::Status(realm, "DISC".to_string()));
                 socket.ptcp_request(p).await;
+                channels.lock().unwrap().remove(&realm);
+                conn_channels.lock().unwrap().remove(&realm);
             }
             PTCPEvent::Data(realm, data) => {
                 let p = session
