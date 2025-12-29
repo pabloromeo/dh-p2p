@@ -2,7 +2,7 @@
 #
 # Multi-stage image that builds the Rust binary and ships a slim runtime.
 # Runtime flags are passed directly to the app (see `ENTRYPOINT`).
-FROM rust:1.74-bullseye AS builder
+FROM rust:1.82-bullseye AS builder
 
 WORKDIR /app
 
