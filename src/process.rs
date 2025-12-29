@@ -161,20 +161,25 @@ pub async fn dh_reader(
             PTCPBody::Status(realm, status) => {
                 if status == "CONN" {
                     info!("Realm {:08x} streaming ready", realm);
-                    conn_channels
-                        .lock()
-                        .unwrap()
-                        .remove(&realm)
-                        .unwrap()
-                        .send(true)
-                        .unwrap();
+                    if let Some(sender) = conn_channels.lock().unwrap().remove(&realm) {
+                        let _ = sender.send(true);
+                    } else {
+                        warn!("Realm {:08x} ready but no waiter found", realm);
+                    }
                 }
             }
             PTCPBody::Payload(p) => {
-                let tx = channels.lock().unwrap().get(&p.realm).unwrap().clone();
+                let tx = {
+                    let guard = channels.lock().unwrap();
+                    guard.get(&p.realm).cloned()
+                };
 
-                if tx.send(p.data).await.is_err() {
-                    warn!("Realm {:08x} unavailable", p.realm);
+                if let Some(tx) = tx {
+                    if tx.send(p.data).await.is_err() {
+                        warn!("Realm {:08x} unavailable", p.realm);
+                    }
+                } else {
+                    warn!("Realm {:08x} payload with no channel", p.realm);
                 }
             }
             _ => {}
