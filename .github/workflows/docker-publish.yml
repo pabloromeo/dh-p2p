@@ -46,9 +46,6 @@ jobs:
             type=semver,pattern={{major}}
             type=sha
 
-      - name: Compute cache tag
-        run: echo "CACHE_TAG=$(echo \"${GITHUB_REF_NAME}\" | tr '/' '-')" >> "$GITHUB_ENV"
-
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -56,11 +53,10 @@ jobs:
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           cache-from: |
-            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ env.CACHE_TAG }}
-            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-develop
+            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache
             type=registry,ref=ghcr.io/${{ github.repository }}:develop
           cache-to: |
-            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ env.CACHE_TAG }},mode=max,compression=zstd
+            type=registry,ref=ghcr.io/${{ github.repository }}:buildcache,mode=max,compression=zstd
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
