@@ -18,6 +18,7 @@ use crate::{
     ptcp::PTCPEvent,
 };
 
+mod buffer;
 mod dh;
 mod process;
 mod ptcp;
@@ -31,6 +32,9 @@ struct Cli {
     /// Relay mode (experimental)
     #[arg(short, long)]
     relay: bool,
+    /// Jitter buffer duration in milliseconds (0 to disable). Default: 0
+    #[arg(short = 'b', long, value_name = "ms", default_value = "0")]
+    buffer_ms: u64,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -143,8 +147,9 @@ async fn main() {
     });
 
     let reader_shutdown = shutdown_rx.clone();
+    let buffer_ms = args.buffer_ms;
     let reader_handle = tokio::spawn(async move {
-        dh_reader(session2, reader, channels, conn_channels, reader_shutdown).await;
+        dh_reader(session2, reader, channels, conn_channels, reader_shutdown, buffer_ms).await;
     });
 
     info!("Ready to connect!");

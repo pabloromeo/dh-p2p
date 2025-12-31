@@ -2,6 +2,7 @@ use log::{info, warn};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -9,6 +10,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
 };
 
+use crate::buffer::JitterBuffer;
 use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
 
 /**
@@ -58,7 +60,6 @@ pub async fn process_reader(
                             let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                             break;
                         }
-
                         n
                     }
                     Err(e) => {
@@ -82,8 +83,8 @@ pub async fn process_reader(
 }
 
 /**
-* Read data from client and send it to devices
-*/
+ * Read data from client and send it to devices
+ */
 pub async fn dh_writer(
     session: Arc<Mutex<PTCPSession>>,
     socket: Arc<UdpSocket>,
@@ -133,6 +134,22 @@ pub async fn dh_writer(
     }
 }
 
+/// Send packets to their respective client channels
+async fn send_to_clients(
+    packets: Vec<(u32, Vec<u8>)>,
+    channels: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+) {
+    for (realm, data) in packets {
+        let tx = {
+            let chans = channels.lock().unwrap();
+            chans.get(&realm).cloned()
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(data).await;
+        }
+    }
+}
+
 /**
  * Read data from devices and send it to clients
  */
@@ -142,47 +159,87 @@ pub async fn dh_reader(
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     mut shutdown: watch::Receiver<bool>,
+    buffer_ms: u64,
 ) {
+    // Create jitter buffer if enabled
+    let mut jitter_buffer = if buffer_ms > 0 {
+        Some(JitterBuffer::new(Duration::from_millis(buffer_ms)))
+    } else {
+        None
+    };
+
+    // Create a tick interval for the buffer (runs every 10ms)
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
+    tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
-        let packet = tokio::select! {
-            packet = socket.ptcp_read() => packet,
-            _ = shutdown.changed() => break,
-        };
-        let packet = session.lock().unwrap().recv(packet);
+        tokio::select! {
+            // Handle incoming packets
+            packet = socket.ptcp_read() => {
+                let seq = packet.sent;
+                let packet = session.lock().unwrap().recv(packet);
 
-        if let PTCPBody::Empty = packet.body {
-            continue;
-        }
+                // Handle empty packets
+                if let PTCPBody::Empty = packet.body {
+                    continue;
+                }
 
-        let p = session.lock().unwrap().send(PTCPBody::Empty);
-        socket.ptcp_request(p).await;
+                // Send ACK
+                let p = session.lock().unwrap().send(PTCPBody::Empty);
+                socket.ptcp_request(p).await;
 
-        match packet.body {
-            PTCPBody::Status(realm, status) => {
-                if status == "CONN" {
-                    info!("Realm {:08x} streaming ready", realm);
-                    if let Some(sender) = conn_channels.lock().unwrap().remove(&realm) {
-                        let _ = sender.send(true);
-                    } else {
-                        warn!("Realm {:08x} ready but no waiter found", realm);
+                match packet.body {
+                    PTCPBody::Status(realm, status) => {
+                        if status == "CONN" {
+                            info!("Realm {:08x} streaming ready", realm);
+                            if let Some(sender) = conn_channels.lock().unwrap().remove(&realm) {
+                                let _ = sender.send(true);
+                            } else {
+                                warn!("Realm {:08x} ready but no waiter found", realm);
+                            }
+                        }
+                    }
+                    PTCPBody::Payload(payload) => {
+                        if let Some(ref mut buffer) = jitter_buffer {
+                            // Insert and get ready packets
+                            let ready = buffer.insert(seq, payload.realm, payload.data);
+                            if !ready.is_empty() {
+                                send_to_clients(ready, &channels).await;
+                            }
+                        } else {
+                            // No buffering - send directly
+                            let tx = {
+                                let chans = channels.lock().unwrap();
+                                chans.get(&payload.realm).cloned()
+                            };
+                            if let Some(tx) = tx {
+                                let _ = tx.send(payload.data).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Periodic tick to flush the buffer
+            _ = tick_interval.tick(), if jitter_buffer.is_some() => {
+                if let Some(ref mut buffer) = jitter_buffer {
+                    let ready = buffer.tick();
+                    if !ready.is_empty() {
+                        send_to_clients(ready, &channels).await;
                     }
                 }
             }
-            PTCPBody::Payload(p) => {
-                let tx = {
-                    let guard = channels.lock().unwrap();
-                    guard.get(&p.realm).cloned()
-                };
 
-                if let Some(tx) = tx {
-                    if tx.send(p.data).await.is_err() {
-                        warn!("Realm {:08x} unavailable", p.realm);
-                    }
-                } else {
-                    warn!("Realm {:08x} payload with no channel", p.realm);
+            // Shutdown
+            _ = shutdown.changed() => {
+                if let Some(ref mut buffer) = jitter_buffer {
+                    let remaining = buffer.flush_all();
+                    send_to_clients(remaining, &channels).await;
+                    buffer.log_stats();
                 }
+                break;
             }
-            _ => {}
         }
     }
 }

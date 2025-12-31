@@ -26,7 +26,7 @@ pub enum PTCPBody {
 }
 
 pub struct PTCPPacket {
-    sent: u32,
+    pub sent: u32,
     recv: u32,
     pid: u32,
     lmid: u32,

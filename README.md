@@ -39,11 +39,38 @@ Options:
           Bind address, port and remote port. Default: 127.0.0.1:1554:554
   -r, --relay
           Relay mode (experimental)
+  -b, --buffer-ms <ms>
+          Jitter buffer duration in milliseconds (0 to disable). Default: 0
   -v, --verbose...
           Increase verbosity (-v for debug, -vv for trace)
   -h, --help
           Print help
 ```
+
+### Jitter Buffer
+
+Since the Dahua P2P protocol uses UDP, packets may arrive out of order. The optional jitter buffer (`-b`) helps smooth out video streaming by:
+
+- Buffering incoming packets for the specified duration (in milliseconds)
+- Releasing them in the correct sequence order
+- Dropping late packets that arrive after the buffer window
+
+**Usage:**
+```bash
+# No buffering (default, direct passthrough)
+./dh-p2p YOUR_SERIAL
+
+# 100ms buffer - good for most networks
+./dh-p2p YOUR_SERIAL -b 100
+
+# 200ms buffer - for higher latency/jitter networks
+./dh-p2p YOUR_SERIAL -b 200
+```
+
+**Tradeoffs:**
+- Longer buffer = better reordering, but adds latency to all packets
+- Shorter buffer = lower latency, but smaller reordering window
+- For typical video streaming, 50-200ms is usually sufficient
 
 ### Graceful shutdown
 
