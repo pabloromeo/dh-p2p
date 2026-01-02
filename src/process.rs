@@ -145,7 +145,18 @@ async fn send_to_clients(
             chans.get(&realm).cloned()
         };
         if let Some(tx) = tx {
-            let _ = tx.send(data).await;
+            // Use try_send to detect backpressure
+            match tx.try_send(data) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(data)) => {
+                    // Channel full - client can't keep up, force send anyway
+                    warn!("Realm {:08x} channel full (backpressure), client may be slow", realm);
+                    let _ = tx.send(data).await;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    warn!("Realm {:08x} channel closed", realm);
+                }
+            }
         }
     }
 }
@@ -197,6 +208,12 @@ pub async fn dh_reader(
                             } else {
                                 warn!("Realm {:08x} ready but no waiter found", realm);
                             }
+                        } else if status == "DISC" || status.starts_with("DISC") {
+                            warn!("Realm {:08x} device sent DISC", realm);
+                            // Remove the channel - device closed the connection
+                            channels.lock().unwrap().remove(&realm);
+                        } else {
+                            info!("Realm {:08x} status: {}", realm, status);
                         }
                     }
                     PTCPBody::Payload(payload) => {

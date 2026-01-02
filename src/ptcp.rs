@@ -311,14 +311,57 @@ impl PTCP for UdpSocket {
         trace!("---");
 
         let packet = packet.serialize();
-        self.send(&packet).await.unwrap();
+        if let Err(e) = self.send(&packet).await {
+            log::error!("PTCP send error: {}", e);
+        }
     }
 
     async fn ptcp_read(&self) -> PTCPPacket {
         trace!("### {}", self.peer_addr().unwrap());
 
-        let mut buf = [0u8; 4096];
-        let n = self.recv(&mut buf).await.unwrap();
+        // Larger buffer for video frames
+        let mut buf = [0u8; 65535];
+        let n = match self.recv(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                log::error!("PTCP recv error: {}", e);
+                // Return an empty packet to keep the loop going
+                return PTCPPacket {
+                    sent: 0,
+                    recv: 0,
+                    pid: 0,
+                    lmid: 0,
+                    rmid: 0,
+                    body: PTCPBody::Empty,
+                };
+            }
+        };
+
+        // Validate minimum packet size
+        if n < 24 {
+            log::warn!("PTCP: received undersized packet ({} bytes)", n);
+            return PTCPPacket {
+                sent: 0,
+                recv: 0,
+                pid: 0,
+                lmid: 0,
+                rmid: 0,
+                body: PTCPBody::Empty,
+            };
+        }
+
+        // Check magic before parsing
+        if &buf[0..4] != b"PTCP" {
+            log::warn!("PTCP: invalid magic in packet");
+            return PTCPPacket {
+                sent: 0,
+                recv: 0,
+                pid: 0,
+                lmid: 0,
+                rmid: 0,
+                body: PTCPBody::Empty,
+            };
+        }
 
         let packet = PTCPPacket::parse(&buf[0..n]);
         debug!("<<< {} {:?}", self.peer_addr().unwrap(), packet.body);
