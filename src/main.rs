@@ -35,6 +35,7 @@ const HEARTBEAT_TIMEOUT_SECS: u64 = HEARTBEAT_INTERVAL_SECS * HEARTBEAT_MISSED_L
 const RESTART_BACKOFF_INITIAL_SECS: u64 = 1;
 const RESTART_BACKOFF_MAX_SECS: u64 = 30;
 const RESTART_BACKOFF_JITTER_MS: u64 = 500;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Parser)]
 #[command(about = "A PoC implementation of TCP tunneling over Dahua P2P protocol.", long_about = None)]
@@ -147,10 +148,23 @@ async fn run_server_once(
         }
     };
 
-    let (socket, session) = match p2p_handshake(socket, serial, relay).await {
-        Ok(res) => res,
-        Err(e) => {
+    let handshake = tokio::time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        p2p_handshake(socket, serial, relay),
+    )
+    .await;
+
+    let (socket, session) = match handshake {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
             warn!("P2P handshake failed: {}", e);
+            return ShutdownReason::Restart;
+        }
+        Err(_) => {
+            warn!(
+                "P2P handshake timed out after {}s",
+                HANDSHAKE_TIMEOUT_SECS
+            );
             return ShutdownReason::Restart;
         }
     };
