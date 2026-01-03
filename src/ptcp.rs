@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use log::{debug, trace};
 use std::cmp;
+use std::io;
 use tokio::net::UdpSocket;
 
 pub enum PTCPEvent {
@@ -298,22 +299,23 @@ impl PTCPSession {
 
 #[async_trait]
 pub trait PTCP {
-    async fn ptcp_request(&self, packet: PTCPPacket);
+    async fn ptcp_request(&self, packet: PTCPPacket) -> io::Result<()>;
     async fn ptcp_read(&self) -> PTCPPacket;
 }
 
 #[async_trait]
 impl PTCP for UdpSocket {
-    async fn ptcp_request(&self, packet: PTCPPacket) {
+    async fn ptcp_request(&self, packet: PTCPPacket) -> io::Result<()> {
         debug!(">>> {} {:?}", self.peer_addr().unwrap(), packet.body);
         trace!("{:?}", packet);
         packet.try_print_data();
         trace!("---");
 
         let packet = packet.serialize();
-        if let Err(e) = self.send(&packet).await {
+        self.send(&packet).await.map(|_| ()).map_err(|e| {
             log::error!("PTCP send error: {}", e);
-        }
+            e
+        })
     }
 
     async fn ptcp_read(&self) -> PTCPPacket {

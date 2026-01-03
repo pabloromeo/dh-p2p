@@ -14,12 +14,14 @@ use tokio::{
 
 use crate::{
     dh::p2p_handshake,
+    fdlog::log_fd_snapshot,
     process::{dh_reader, dh_writer, process_reader, process_writer},
     ptcp::PTCPEvent,
 };
 
 mod buffer;
 mod dh;
+mod fdlog;
 mod process;
 mod ptcp;
 
@@ -89,6 +91,7 @@ async fn main() {
 
     let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(128);
     let (shutdown_tx, shutdown_rx) = watch::channel::<bool>(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
     let session = Arc::new(Mutex::new(session));
 
     let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
@@ -107,10 +110,40 @@ async fn main() {
     let channels2 = channels.clone();
     let conn_channels2 = conn_channels.clone();
 
-    let shutdown_notify = shutdown_tx;
+    let shutdown_notify = shutdown_tx.clone();
     let shutdown_handle = tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         let _ = shutdown_notify.send(true);
+    });
+
+    // Periodic FD and channel usage logging
+    let mut fd_monitor_shutdown = shutdown_rx.clone();
+    let fd_monitor_channels = channels2.clone();
+    let fd_monitor_conn_channels = conn_channels2.clone();
+    let fd_monitor_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let (chan_len, conn_len) = {
+                        let chans = fd_monitor_channels.lock().unwrap();
+                        let conns = fd_monitor_conn_channels.lock().unwrap();
+                        (chans.len(), conns.len())
+                    };
+                    log_fd_snapshot("periodic", chan_len, conn_len);
+                }
+                _ = fd_monitor_shutdown.changed() => {
+                    let (chan_len, conn_len) = {
+                        let chans = fd_monitor_channels.lock().unwrap();
+                        let conns = fd_monitor_conn_channels.lock().unwrap();
+                        (chans.len(), conns.len())
+                    };
+                    log_fd_snapshot("shutdown", chan_len, conn_len);
+                    break;
+                }
+            }
+        }
     });
 
     let mut hb_shutdown = shutdown_rx.clone();
@@ -133,6 +166,7 @@ async fn main() {
     let writer_shutdown = shutdown_rx.clone();
     let writer_channels = Arc::clone(&channels2);
     let writer_conn_channels = Arc::clone(&conn_channels2);
+    let shutdown_tx_writer = shutdown_tx.clone();
     let writer_handle = tokio::spawn(async move {
         dh_writer(
             session,
@@ -140,6 +174,7 @@ async fn main() {
             dh_rx,
             remote_port.into(),
             writer_shutdown,
+            shutdown_tx_writer,
             writer_channels,
             writer_conn_channels,
         )
@@ -148,8 +183,18 @@ async fn main() {
 
     let reader_shutdown = shutdown_rx.clone();
     let buffer_ms = args.buffer_ms;
+    let shutdown_tx_reader = shutdown_tx.clone();
     let reader_handle = tokio::spawn(async move {
-        dh_reader(session2, reader, channels, conn_channels, reader_shutdown, buffer_ms).await;
+        dh_reader(
+            session2,
+            reader,
+            channels,
+            conn_channels,
+            reader_shutdown,
+            shutdown_tx_reader,
+            buffer_ms,
+        )
+        .await;
     });
 
     info!("Ready to connect!");
@@ -195,6 +240,11 @@ async fn main() {
         // Store the channel in the map
         channels2.lock().unwrap().insert(realm_id, tx);
         conn_channels2.lock().unwrap().insert(realm_id, conn_tx);
+        {
+            let chans = channels2.lock().unwrap();
+            let conns = conn_channels2.lock().unwrap();
+            log_fd_snapshot("after accept", chans.len(), conns.len());
+        }
 
         if dh_tx.send(PTCPEvent::Connect(realm_id)).await.is_err() {
             warn!("Failed to enqueue connect event for realm {:08x}", realm_id);
@@ -247,6 +297,7 @@ async fn main() {
     let _ = writer_handle.await;
     let _ = reader_handle.await;
     let _ = shutdown_handle.await;
+    let _ = fd_monitor_handle.await;
 }
 
 async fn wait_for_shutdown_signal() {

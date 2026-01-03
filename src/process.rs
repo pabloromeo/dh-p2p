@@ -11,7 +11,21 @@ use tokio::{
 };
 
 use crate::buffer::JitterBuffer;
+use crate::fdlog::log_fd_snapshot;
 use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
+
+fn log_fd_state(
+    label: &str,
+    channels: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    conn_channels: &Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+) {
+    let (chan_len, conn_len) = {
+        let chans = channels.lock().unwrap();
+        let conns = conn_channels.lock().unwrap();
+        (chans.len(), conns.len())
+    };
+    log_fd_snapshot(label, chan_len, conn_len);
+}
 
 /**
  * Read data from the channel and write it back to the client
@@ -91,6 +105,7 @@ pub async fn dh_writer(
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
     mut shutdown: watch::Receiver<bool>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 ) {
@@ -105,30 +120,67 @@ pub async fn dh_writer(
         match ev {
             PTCPEvent::Heartbeat => {
                 let p = session.lock().unwrap().send(PTCPBody::Heartbeat);
-                socket.ptcp_request(p).await;
+                if let Err(e) = socket.ptcp_request(p).await {
+                    log::error!("PTCP heartbeat send error: {}", e);
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                }
             }
             PTCPEvent::Connect(realm) => {
                 let p = session
                     .lock()
                     .unwrap()
                     .send(PTCPBody::Bind(realm, remote_port));
-                socket.ptcp_request(p).await;
+                if let Err(e) = socket.ptcp_request(p).await {
+                    log::error!(
+                        "PTCP bind send error for realm {:08x}: {}",
+                        realm,
+                        e
+                    );
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                }
             }
             PTCPEvent::Disconnect(realm) => {
                 let p = session
                     .lock()
                     .unwrap()
                     .send(PTCPBody::Status(realm, "DISC".to_string()));
-                socket.ptcp_request(p).await;
+                if let Err(e) = socket.ptcp_request(p).await {
+                    log::error!(
+                        "PTCP disconnect send error for realm {:08x}: {}",
+                        realm,
+                        e
+                    );
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                }
                 channels.lock().unwrap().remove(&realm);
                 conn_channels.lock().unwrap().remove(&realm);
+                log_fd_state("dh_writer disconnect", &channels, &conn_channels);
             }
             PTCPEvent::Data(realm, data) => {
                 let p = session
                     .lock()
                     .unwrap()
                     .send(PTCPBody::Payload(PTCPPayload { realm, data }));
-                socket.ptcp_request(p).await;
+                if let Err(e) = socket.ptcp_request(p).await {
+                    log::error!(
+                        "PTCP payload send error for realm {:08x}: {}",
+                        realm,
+                        e
+                    );
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -170,6 +222,7 @@ pub async fn dh_reader(
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     mut shutdown: watch::Receiver<bool>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
     buffer_ms: u64,
 ) {
     // Create jitter buffer if enabled
@@ -197,7 +250,13 @@ pub async fn dh_reader(
 
                 // Send ACK
                 let p = session.lock().unwrap().send(PTCPBody::Empty);
-                socket.ptcp_request(p).await;
+                if let Err(e) = socket.ptcp_request(p).await {
+                    log::error!("PTCP ack send error: {}", e);
+                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
+                }
 
                 match packet.body {
                     PTCPBody::Status(realm, status) => {
@@ -208,10 +267,12 @@ pub async fn dh_reader(
                             } else {
                                 warn!("Realm {:08x} ready but no waiter found", realm);
                             }
+                            log_fd_state("dh_reader conn ready", &channels, &conn_channels);
                         } else if status == "DISC" || status.starts_with("DISC") {
                             warn!("Realm {:08x} device sent DISC", realm);
                             // Remove the channel - device closed the connection
                             channels.lock().unwrap().remove(&realm);
+                            log_fd_state("dh_reader device disc", &channels, &conn_channels);
                         } else {
                             info!("Realm {:08x} status: {}", realm, status);
                         }
