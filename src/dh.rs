@@ -7,6 +7,7 @@ use tokio::{net::UdpSocket, time};
 use xml::reader::{EventReader, XmlEvent};
 
 use crate::ptcp::{PTCPBody, PTCPSession, PTCP};
+use std::io;
 
 static MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
 
@@ -29,11 +30,11 @@ pub async fn p2p_handshake(
     socket: UdpSocket,
     serial: String,
     relay_mode: bool,
-) -> (UdpSocket, PTCPSession) {
+) -> io::Result<(UdpSocket, PTCPSession)> {
     let mut cseq = 0;
 
     info!("Connecting to P2P service...");
-    socket.connect(MAIN_SERVER).await.unwrap();
+    socket.connect(MAIN_SERVER).await?;
 
     socket.dh_request("/probe/p2psrv", None, &mut cseq).await;
     socket.dh_read().await;
@@ -51,8 +52,8 @@ pub async fn p2p_handshake(
     let relay = &socket.dh_read().await.body.unwrap()["body/Address"];
 
     info!("Probing device {}...", serial);
-    let socket2 = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-    socket2.connect(p2psrv).await.unwrap();
+    let socket2 = UdpSocket::bind("0.0.0.0:0").await?;
+    socket2.connect(p2psrv).await?;
 
     socket2
         .dh_request(
@@ -90,7 +91,7 @@ pub async fn p2p_handshake(
         .await;
 
     info!("Setting up relay connection...");
-    socket2.connect(relay).await.unwrap();
+    socket2.connect(relay).await?;
 
     debug!("Requesting relay agent...");
     socket2.dh_request("/relay/agent", None, &mut cseq).await;
@@ -99,7 +100,7 @@ pub async fn p2p_handshake(
     let agent = &data["body/Agent"];
     debug!("Got agent: {}", agent);
 
-    socket2.connect(agent).await.unwrap();
+    socket2.connect(agent).await?;
 
     debug!("Starting relay...");
     socket2
@@ -135,7 +136,7 @@ pub async fn p2p_handshake(
     let device = &data["body/PubAddr"];
 
     // not necessary when relay_mode is true, but UDP is connectionless
-    socket.connect(device).await.unwrap();
+    socket.connect(device).await?;
 
     let max_retries = 5;
     let mut attempt = 0;
@@ -147,7 +148,7 @@ pub async fn p2p_handshake(
         );
 
         // Send the relay-channel request via the main server
-        socket2.connect(MAIN_SERVER).await.unwrap();
+        socket2.connect(MAIN_SERVER).await?;
         socket2
             .dh_request(
                 format!("/device/{}/relay-channel", serial).as_ref(),
@@ -157,7 +158,7 @@ pub async fn p2p_handshake(
             .await;
 
         // Switch to the agent to await the confirmation
-        socket2.connect(agent).await.unwrap();
+        socket2.connect(agent).await?;
         debug!("Waiting for relay channel confirmation...");
 
         match time::timeout(time::Duration::from_millis(500), socket2.dh_read()).await {
@@ -193,7 +194,7 @@ pub async fn p2p_handshake(
 
     if relay_mode {
         info!("Relay mode enabled");
-        return (socket2, session);
+        return Ok((socket2, session));
     }
 
     socket2
@@ -244,7 +245,7 @@ pub async fn p2p_handshake(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    socket.send(&data).await.unwrap();
+    socket.send(&data).await?;
     trace!("---");
 
     trace!("<<< {}", socket.peer_addr().unwrap());
@@ -289,13 +290,13 @@ pub async fn p2p_handshake(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    socket.send(&data).await.unwrap();
+    socket.send(&data).await?;
     trace!("---");
 
     // read 5 times
     for _ in 0..5 {
         trace!("<<< {}", socket.peer_addr().unwrap());
-        let n = socket.recv(&mut buf).await.unwrap();
+        let n = socket.recv(&mut buf).await?;
         trace!(
             "Raw [{}]",
             buf[0..n]
@@ -351,7 +352,7 @@ pub async fn p2p_handshake(
     assert!(matches!(res.body, PTCPBody::Empty), "Invalid response");
 
     info!("P2P handshake complete");
-    (socket, session)
+    Ok((socket, session))
 }
 
 #[derive(Debug)]

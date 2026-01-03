@@ -13,6 +13,7 @@ use tokio::{
 use crate::buffer::JitterBuffer;
 use crate::fdlog::log_fd_snapshot;
 use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
+use crate::shutdown::ShutdownReason;
 
 fn log_fd_state(
     label: &str,
@@ -33,7 +34,7 @@ fn log_fd_state(
 pub async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<Vec<u8>>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     loop {
         tokio::select! {
@@ -60,7 +61,7 @@ pub async fn process_reader(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     realm_id: u32,
     dh_tx: mpsc::Sender<PTCPEvent>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     let mut buf = [0u8; 4096];
 
@@ -104,8 +105,8 @@ pub async fn dh_writer(
     socket: Arc<UdpSocket>,
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
-    mut shutdown: watch::Receiver<bool>,
-    shutdown_tx: Arc<watch::Sender<bool>>,
+    mut shutdown: watch::Receiver<ShutdownReason>,
+    shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 ) {
@@ -123,7 +124,7 @@ pub async fn dh_writer(
                 if let Err(e) = socket.ptcp_request(p).await {
                     log::error!("PTCP heartbeat send error: {}", e);
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(true);
+                        let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
                     }
                 }
@@ -140,7 +141,7 @@ pub async fn dh_writer(
                         e
                     );
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(true);
+                        let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
                     }
                 }
@@ -157,7 +158,7 @@ pub async fn dh_writer(
                         e
                     );
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(true);
+                        let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
                     }
                 }
@@ -177,7 +178,7 @@ pub async fn dh_writer(
                         e
                     );
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(true);
+                        let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
                     }
                 }
@@ -221,8 +222,9 @@ pub async fn dh_reader(
     socket: Arc<UdpSocket>,
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
-    mut shutdown: watch::Receiver<bool>,
-    shutdown_tx: Arc<watch::Sender<bool>>,
+    mut shutdown: watch::Receiver<ShutdownReason>,
+    shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
+    last_activity: Arc<Mutex<std::time::Instant>>,
     buffer_ms: u64,
 ) {
     // Create jitter buffer if enabled
@@ -242,6 +244,10 @@ pub async fn dh_reader(
             packet = socket.ptcp_read() => {
                 let seq = packet.sent;
                 let packet = session.lock().unwrap().recv(packet);
+                {
+                    let mut last = last_activity.lock().unwrap();
+                    *last = std::time::Instant::now();
+                }
 
                 // Handle empty packets
                 if let PTCPBody::Empty = packet.body {
@@ -253,7 +259,7 @@ pub async fn dh_reader(
                 if let Err(e) = socket.ptcp_request(p).await {
                     log::error!("PTCP ack send error: {}", e);
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(true);
+                        let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
                     }
                 }
