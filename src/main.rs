@@ -333,7 +333,7 @@ async fn run_server_once(
                 break;
             }
         };
-        info!("Accepted connection from {}", addr);
+        info!("Accepted connection from {} (new client)", addr);
 
         // Create a channel for the client
         let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
@@ -342,6 +342,10 @@ async fn run_server_once(
         let mut shutdown_conn = shutdown_rx.clone();
 
         let realm_id = rand::random::<u32>();
+        info!(
+            "Client {} assigned realm {:08x}; enqueuing PTCP Connect",
+            addr, realm_id
+        );
 
         // Store the channel in the map
         channels2.lock().unwrap().insert(realm_id, tx);
@@ -357,15 +361,29 @@ async fn run_server_once(
             continue;
         }
 
+        info!(
+            "Waiting for realm {:08x} to become ready (client {})",
+            realm_id, addr
+        );
         tokio::select! {
             res = conn_rx => {
                 if res.is_err() {
                     warn!("Realm {:08x} connection handshake failed", realm_id);
                     continue;
                 }
+                info!(
+                    "Realm {:08x} ready; starting reader/writer tasks for client {}",
+                    realm_id, addr
+                );
             }
             _ = shutdown_conn.changed() => {
-                info!("Shutdown before realm {:08x} became ready", realm_id);
+                info!(
+                    "Shutdown before realm {:08x} became ready (client {})",
+                    realm_id, addr
+                );
+                // Remove partially registered realm before continuing
+                channels2.lock().unwrap().remove(&realm_id);
+                conn_channels2.lock().unwrap().remove(&realm_id);
                 continue;
             }
         }
@@ -374,8 +392,9 @@ async fn run_server_once(
 
         tokio::spawn({
             let shutdown_rx = shutdown_rx.clone();
+            let peer = addr;
             async move {
-                process_reader(reader, realm_id, dh_tx, shutdown_rx).await;
+                process_reader(reader, realm_id, peer, dh_tx, shutdown_rx).await;
             }
         });
 

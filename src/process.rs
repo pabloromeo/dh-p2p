@@ -1,6 +1,7 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -60,6 +61,7 @@ pub async fn process_writer(
 pub async fn process_reader(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     realm_id: u32,
+    peer: SocketAddr,
     dh_tx: mpsc::Sender<PTCPEvent>,
     mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
@@ -71,14 +73,20 @@ pub async fn process_reader(
                 match res {
                     Ok(n) => {
                         if n == 0 {
-                            warn!("Reader: Socket closed by peer.");
+                            warn!(
+                                "Reader: socket closed by peer {} (realm {:08x})",
+                                peer, realm_id
+                            );
                             let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                             break;
                         }
                         n
                     }
                     Err(e) => {
-                        warn!("Reader: {}", e);
+                        warn!(
+                            "Reader error from {} (realm {:08x}): {}",
+                            peer, realm_id, e
+                        );
                         let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                         break;
                     }
@@ -162,8 +170,12 @@ pub async fn dh_writer(
                         break;
                     }
                 }
-                channels.lock().unwrap().remove(&realm);
-                conn_channels.lock().unwrap().remove(&realm);
+                let removed_chan = channels.lock().unwrap().remove(&realm).is_some();
+                let removed_conn = conn_channels.lock().unwrap().remove(&realm).is_some();
+                info!(
+                    "Realm {:08x} client disconnect cleanup: channel_removed={}, conn_removed={}",
+                    realm, removed_chan, removed_conn
+                );
                 log_fd_state("dh_writer disconnect", &channels, &conn_channels);
             }
             PTCPEvent::Data(realm, data) => {
@@ -275,10 +287,13 @@ pub async fn dh_reader(
                             }
                             log_fd_state("dh_reader conn ready", &channels, &conn_channels);
                         } else if status == "DISC" || status.starts_with("DISC") {
-                            warn!("Realm {:08x} device sent DISC", realm);
-                            // Remove the channel - device closed the connection
-                            channels.lock().unwrap().remove(&realm);
-                            log_fd_state("dh_reader device disc", &channels, &conn_channels);
+                            let removed = channels.lock().unwrap().remove(&realm);
+                            if removed.is_some() {
+                                warn!("Realm {:08x} device sent DISC", realm);
+                                log_fd_state("dh_reader device disc", &channels, &conn_channels);
+                            } else {
+                                debug!("Realm {:08x} device sent DISC (already removed)", realm);
+                            }
                         } else {
                             info!("Realm {:08x} status: {}", realm, status);
                         }
