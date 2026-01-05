@@ -368,6 +368,7 @@ pub async fn dh_reader(
     buffer_ms: u64,
     channel_capacity: usize,
     health: Arc<HealthCounters>,
+    heartbeat_ok: Option<Arc<AtomicBool>>,
 ) {
     // Create jitter buffer if enabled
     let mut jitter_buffer = if buffer_ms > 0 {
@@ -392,6 +393,9 @@ pub async fn dh_reader(
                 {
                     let mut last = last_activity.lock().unwrap();
                     *last = std::time::Instant::now();
+                }
+                if let Some(flag) = &heartbeat_ok {
+                    flag.store(true, Ordering::Relaxed);
                 }
 
                 // Handle empty packets

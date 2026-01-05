@@ -15,4 +15,5 @@ log = "0.4"
 rand = "0.8.5"
 sha1 = "0.10.6"
 tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
 xml-rs = "0.8.19"

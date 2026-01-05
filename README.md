@@ -45,10 +45,22 @@ Options:
           Drop policy for slow clients: block|drop_newest|keep_latest (default: block)
       --health-interval-secs <secs>
           Interval for periodic health logs (default: 60)
+      --enable-probe
+          Enable HTTP probe server for liveness/readiness (/livez, /readyz)
+      --probe-port <port>
+          HTTP probe listen port (default: 8080)
   -v, --verbose...
           Increase verbosity (-v for debug, -vv for trace)
   -h, --help
           Print help
+
+### HTTP probes
+
+When `--enable-probe` is set, an internal HTTP server exposes:
+- `/livez`: always 200 OK while the process runs.
+- `/readyz`: 200 OK only after PTCP handshake succeeds and heartbeat/activity is healthy; otherwise 503.
+
+Configure probe port with `--probe-port` (default 8080). Intended for Kubernetes liveness/readiness probes.
 ```
 
 ### Jitter Buffer

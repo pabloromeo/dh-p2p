@@ -2,9 +2,14 @@ use clap::Parser;
 use log::{debug, info, warn};
 use std::{
     collections::HashMap,
-    sync::{atomic::Ordering, Arc, Mutex},
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
+use axum::{extract::State, http::StatusCode, routing::get, serve, Router};
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use tokio::{
@@ -33,6 +38,30 @@ mod shutdown;
 mod supervisor;
 mod transport;
 
+#[derive(Clone, Default)]
+struct ProbeState {
+    handshake_ready: Arc<AtomicBool>,
+    heartbeat_ok: Arc<AtomicBool>,
+}
+
+impl ProbeState {
+    fn is_ready(&self) -> bool {
+        self.handshake_ready.load(Ordering::Relaxed) && self.heartbeat_ok.load(Ordering::Relaxed)
+    }
+}
+
+async fn live_handler() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn ready_handler(State(state): State<ProbeState>) -> StatusCode {
+    if state.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
 #[derive(Parser)]
 #[command(about = "A PoC implementation of TCP tunneling over Dahua P2P protocol.", long_about = None)]
 struct Cli {
@@ -51,6 +80,12 @@ struct Cli {
     /// Health log interval in seconds
     #[arg(long, value_name = "secs", default_value = "60")]
     health_interval_secs: u64,
+    /// Enable HTTP probe server (/livez, /readyz)
+    #[arg(long, default_value_t = false)]
+    enable_probe: bool,
+    /// HTTP probe listen port
+    #[arg(long, value_name = "port", default_value = "8080")]
+    probe_port: u16,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -81,6 +116,8 @@ async fn main() {
     let mut config = Config::default();
     config.jitter_buffer_ms = args.buffer_ms;
     config.health_interval_secs = args.health_interval_secs;
+    config.enable_probe = args.enable_probe;
+    config.probe_port = args.probe_port;
     config.drop_policy = match args.drop_policy.as_str() {
         "block" => DropPolicy::Block,
         "drop_newest" => DropPolicy::DropNewest,
@@ -196,6 +233,12 @@ async fn run_server_once(
     let session = Arc::new(Mutex::new(session));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let health = Arc::new(HealthCounters::default());
+    let probe_state = ProbeState::default();
+    let probe_state_opt = if config.enable_probe {
+        Some(probe_state.clone())
+    } else {
+        None
+    };
 
     let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
@@ -204,6 +247,10 @@ async fn run_server_once(
         "PTCP session established (serial={}, relay={}, remote_port={})",
         serial, relay, remote_port
     );
+    if let Some(state) = probe_state_opt.as_ref() {
+        state.handshake_ready.store(true, Ordering::Relaxed);
+        state.heartbeat_ok.store(true, Ordering::Relaxed);
+    }
     metrics.inc_counter("handshake_success");
 
     /*
@@ -297,6 +344,11 @@ async fn run_server_once(
     let drop_policy = config.drop_policy.clone();
     let channel_capacity = config.channel_capacity;
     let health_reader = health.clone();
+    let heartbeat_ok_flag = if config.enable_probe {
+        Some(probe_state.heartbeat_ok.clone())
+    } else {
+        None
+    };
     let reader_handle = tokio::spawn(async move {
         dh_reader(
             session2,
@@ -310,6 +362,7 @@ async fn run_server_once(
             buffer_ms,
             channel_capacity,
             health_reader,
+            heartbeat_ok_flag,
         )
         .await;
     });
@@ -319,6 +372,11 @@ async fn run_server_once(
     let shutdown_tx_watchdog = shutdown_tx.clone();
     let last_activity_watchdog = last_activity.clone();
     let watchdog_config = config.clone();
+    let heartbeat_flag = if config.enable_probe {
+        Some(probe_state.heartbeat_ok.clone())
+    } else {
+        None
+    };
     let watchdog_handle = tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(watchdog_config.heartbeat_interval_secs));
@@ -333,6 +391,9 @@ async fn run_server_once(
                     );
                     if last.elapsed() >= timeout {
                         warn!("No PTCP activity for {:?}, requesting restart", timeout);
+                        if let Some(flag) = &heartbeat_flag {
+                            flag.store(false, Ordering::Relaxed);
+                        }
                         let _ = shutdown_tx_watchdog.send(ShutdownReason::Restart);
                         break;
                     }
@@ -404,6 +465,33 @@ async fn run_server_once(
             }
         }
     });
+
+    // Probe server
+    let probe_handle = if config.enable_probe {
+        let probe_state_server = probe_state.clone();
+        let mut probe_shutdown = shutdown_rx.clone();
+        let addr: SocketAddr = format!("0.0.0.0:{}", config.probe_port)
+            .parse()
+            .expect("invalid probe port");
+        info!("HTTP probe enabled on port {}", config.probe_port);
+        Some(tokio::spawn(async move {
+            let app = Router::new()
+                .route("/livez", get(live_handler))
+                .route("/readyz", get(ready_handler))
+                .with_state(probe_state_server);
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .expect("failed to bind probe port");
+            let serve_fut = serve(listener, app);
+            let _ = serve_fut
+                .with_graceful_shutdown(async move {
+                    let _ = probe_shutdown.changed().await;
+                })
+                .await;
+        }))
+    } else {
+        None
+    };
 
     info!(
         "Ready to accept TCP clients on {}:{} (remote_port={}, buffer_ms={}, drop_policy={:?})",
@@ -557,6 +645,13 @@ async fn run_server_once(
     let _ = fd_monitor_handle.await;
     let _ = watchdog_handle.await;
     let _ = health_handle.await;
+    if let Some(state) = probe_state_opt.as_ref() {
+        state.handshake_ready.store(false, Ordering::Relaxed);
+        state.heartbeat_ok.store(false, Ordering::Relaxed);
+    }
+    if let Some(handle) = probe_handle {
+        let _ = handle.await;
+    }
 
     if shutdown_reason == ShutdownReason::Restart {
         shutdown_handle.abort();
