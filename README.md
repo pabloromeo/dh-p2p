@@ -41,13 +41,13 @@ Options:
           Relay mode (experimental)
   -b, --buffer-ms <ms>
           Jitter buffer duration in milliseconds (0 to disable). Default: 0
-      --drop-policy <policy>
+  -d, --drop-policy <policy>
           Drop policy for slow clients: block|drop_newest|keep_latest (default: block)
-      --health-interval-secs <secs>
+  -H, --health-interval-secs <secs>
           Interval for periodic health logs (default: 60)
-      --enable-probe
+  -e, --enable-probe
           Enable HTTP probe server for liveness/readiness (/livez, /readyz)
-      --probe-port <port>
+  -P, --probe-port <port>
           HTTP probe listen port (default: 8080)
   -v, --verbose...
           Increase verbosity (-v for debug, -vv for trace)

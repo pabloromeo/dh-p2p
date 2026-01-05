@@ -71,20 +71,20 @@ struct Cli {
     /// Relay mode (experimental)
     #[arg(short, long)]
     relay: bool,
-    /// Jitter buffer duration in milliseconds (0 to disable). Default: 0
+    /// Jitter buffer duration in milliseconds (0 to disable)
     #[arg(short = 'b', long, value_name = "ms", default_value = "0")]
     buffer_ms: u64,
     /// Drop policy for slow clients: block|drop_newest|keep_latest
-    #[arg(long, value_name = "policy", default_value = "block")]
+    #[arg(short = 'd', long = "drop-policy", value_name = "policy", default_value = "block")]
     drop_policy: String,
     /// Health log interval in seconds
-    #[arg(long, value_name = "secs", default_value = "60")]
+    #[arg(short = 'H', long = "health-interval-secs", value_name = "secs", default_value = "60")]
     health_interval_secs: u64,
     /// Enable HTTP probe server (/livez, /readyz)
-    #[arg(long, default_value_t = false)]
+    #[arg(short = 'e', long = "enable-probe", default_value_t = false)]
     enable_probe: bool,
     /// HTTP probe listen port
-    #[arg(long, value_name = "port", default_value = "8080")]
+    #[arg(short = 'P', long = "probe-port", value_name = "port", default_value = "8080")]
     probe_port: u16,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
