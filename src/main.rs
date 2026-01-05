@@ -77,7 +77,7 @@ struct Cli {
     /// Drop policy for slow clients: block|drop_newest|keep_latest
     #[arg(short = 'd', long = "drop-policy", value_name = "policy", default_value = "block")]
     drop_policy: String,
-    /// Health log interval in seconds
+    /// Health log interval in seconds (0 disables health logging)
     #[arg(short = 'H', long = "health-interval-secs", value_name = "secs", default_value = "60")]
     health_interval_secs: u64,
     /// Enable HTTP probe server (/livez, /readyz)
@@ -409,62 +409,67 @@ async fn run_server_once(
     let health_conn_channels = conn_channels2.clone();
     let health_counters = health.clone();
     let health_interval_secs = config.health_interval_secs;
-    let health_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(health_interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let realms = health_channels.lock().unwrap().len();
-                    let waiters = health_conn_channels.lock().unwrap().len();
-                    let bytes_in = health_counters.bytes_from_device.swap(0, Ordering::Relaxed);
-                    let bytes_out = health_counters.bytes_to_device.swap(0, Ordering::Relaxed);
-                    let pkts_in = health_counters.packets_from_device.swap(0, Ordering::Relaxed);
-                    let pkts_out = health_counters.packets_to_device.swap(0, Ordering::Relaxed);
-                    let drops_newest = health_counters.drops_newest.swap(0, Ordering::Relaxed);
-                    let drops_oldest = health_counters.drops_oldest.swap(0, Ordering::Relaxed);
-                    let interval = health_interval_secs as u64;
-                    let in_bps = bytes_in / interval;
-                    let out_bps = bytes_out / interval;
-                    let jitter_in_pkts = health_counters
-                        .jitter_in_packets
-                        .swap(0, Ordering::Relaxed);
-                    let jitter_out_pkts = health_counters
-                        .jitter_out_packets
-                        .swap(0, Ordering::Relaxed);
-                    let jitter_in_bytes =
-                        health_counters.jitter_in_bytes.swap(0, Ordering::Relaxed);
-                    let jitter_out_bytes =
-                        health_counters.jitter_out_bytes.swap(0, Ordering::Relaxed);
-                    let jitter_late_drops =
-                        health_counters.jitter_late_drops.swap(0, Ordering::Relaxed);
-                    let jitter_max_depth =
-                        health_counters.jitter_max_depth.swap(0, Ordering::Relaxed);
-                    info!(
-                        "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={}",
-                        realms,
-                        waiters,
-                        bytes_in,
-                        bytes_out,
-                        in_bps,
-                        out_bps,
-                        pkts_in,
-                        pkts_out,
-                        drops_newest,
-                        drops_oldest,
-                        health_counters.jitter_enabled.load(Ordering::Relaxed),
-                        jitter_in_pkts,
-                        jitter_out_pkts,
-                        jitter_in_bytes,
-                        jitter_out_bytes,
-                        jitter_late_drops,
-                        jitter_max_depth,
-                    );
+    let health_handle = if health_interval_secs == 0 {
+        info!("Health logging disabled (interval set to 0)");
+        None
+    } else {
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(health_interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let realms = health_channels.lock().unwrap().len();
+                        let waiters = health_conn_channels.lock().unwrap().len();
+                        let bytes_in = health_counters.bytes_from_device.swap(0, Ordering::Relaxed);
+                        let bytes_out = health_counters.bytes_to_device.swap(0, Ordering::Relaxed);
+                        let pkts_in = health_counters.packets_from_device.swap(0, Ordering::Relaxed);
+                        let pkts_out = health_counters.packets_to_device.swap(0, Ordering::Relaxed);
+                        let drops_newest = health_counters.drops_newest.swap(0, Ordering::Relaxed);
+                        let drops_oldest = health_counters.drops_oldest.swap(0, Ordering::Relaxed);
+                        let interval = health_interval_secs as u64;
+                        let in_bps = bytes_in / interval;
+                        let out_bps = bytes_out / interval;
+                        let jitter_in_pkts = health_counters
+                            .jitter_in_packets
+                            .swap(0, Ordering::Relaxed);
+                        let jitter_out_pkts = health_counters
+                            .jitter_out_packets
+                            .swap(0, Ordering::Relaxed);
+                        let jitter_in_bytes =
+                            health_counters.jitter_in_bytes.swap(0, Ordering::Relaxed);
+                        let jitter_out_bytes =
+                            health_counters.jitter_out_bytes.swap(0, Ordering::Relaxed);
+                        let jitter_late_drops =
+                            health_counters.jitter_late_drops.swap(0, Ordering::Relaxed);
+                        let jitter_max_depth =
+                            health_counters.jitter_max_depth.swap(0, Ordering::Relaxed);
+                        info!(
+                            "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={}",
+                            realms,
+                            waiters,
+                            bytes_in,
+                            bytes_out,
+                            in_bps,
+                            out_bps,
+                            pkts_in,
+                            pkts_out,
+                            drops_newest,
+                            drops_oldest,
+                            health_counters.jitter_enabled.load(Ordering::Relaxed),
+                            jitter_in_pkts,
+                            jitter_out_pkts,
+                            jitter_in_bytes,
+                            jitter_out_bytes,
+                            jitter_late_drops,
+                            jitter_max_depth,
+                        );
+                    }
+                    _ = health_shutdown.changed() => break,
                 }
-                _ = health_shutdown.changed() => break,
             }
-        }
-    });
+        }))
+    };
 
     // Probe server
     let probe_handle = if config.enable_probe {
@@ -644,7 +649,9 @@ async fn run_server_once(
     let _ = reader_handle.await;
     let _ = fd_monitor_handle.await;
     let _ = watchdog_handle.await;
-    let _ = health_handle.await;
+    if let Some(handle) = health_handle {
+        let _ = handle.await;
+    }
     if let Some(state) = probe_state_opt.as_ref() {
         state.handshake_ready.store(false, Ordering::Relaxed);
         state.heartbeat_ok.store(false, Ordering::Relaxed);
