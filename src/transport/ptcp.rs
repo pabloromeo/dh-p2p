@@ -1,3 +1,4 @@
+// Moved from ptcp.rs
 use async_trait::async_trait;
 use log::{debug, trace};
 use std::cmp;
@@ -40,7 +41,6 @@ impl PTCPPayload {
         assert!(data.len() >= 12, "Invalid payload");
         assert_eq!(data[0], 0x10, "Invalid header");
 
-        // first 4 bytes it header
         let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let length = header & 0xFFFF;
         let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
@@ -261,9 +261,6 @@ impl PTCPSession {
         let lmid = self.id;
         let rmid = self.rmid;
 
-        /*
-         * Update counters
-         */
         self.sent += body.len() as u32;
 
         self.id += 1;
@@ -284,12 +281,6 @@ impl PTCPSession {
     }
 
     pub fn recv(&mut self, packet: PTCPPacket) -> PTCPPacket {
-        // Original implementation
-        //self.recv += packet.body.len() as u32;
-
-        // Instead of tracking our own recv counter, just trust the device's sent counter.
-        // This ensures we always report receiving exactly what the device claims to have sent,
-        // avoiding any counter mismatch that might cause the device to close the connection.
         self.recv = packet.sent + packet.body.len() as u32;
         self.rmid = packet.lmid;
 
@@ -327,7 +318,6 @@ impl PTCP for UdpSocket {
             Ok(n) => n,
             Err(e) => {
                 log::error!("PTCP recv error: {}", e);
-                // Return an empty packet to keep the loop going
                 return PTCPPacket {
                     sent: 0,
                     recv: 0,
@@ -339,7 +329,6 @@ impl PTCP for UdpSocket {
             }
         };
 
-        // Validate minimum packet size
         if n < 24 {
             log::warn!("PTCP: received undersized packet ({} bytes)", n);
             return PTCPPacket {
@@ -352,7 +341,6 @@ impl PTCP for UdpSocket {
             };
         }
 
-        // Check magic before parsing
         if &buf[0..4] != b"PTCP" {
             log::warn!("PTCP: invalid magic in packet");
             return PTCPPacket {
@@ -374,3 +362,4 @@ impl PTCP for UdpSocket {
         packet
     }
 }
+

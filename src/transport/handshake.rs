@@ -2,12 +2,11 @@ use async_trait::async_trait;
 use base64::Engine;
 use log::{debug, error, info, trace, warn};
 use sha1::Digest;
-use std::{collections::HashMap, net::SocketAddrV4};
+use std::{collections::HashMap, io, net::SocketAddrV4, time::Instant};
 use tokio::{net::UdpSocket, time};
 use xml::reader::{EventReader, XmlEvent};
 
-use crate::ptcp::{PTCPBody, PTCPSession, PTCP};
-use std::io;
+use super::ptcp::{PTCPBody, PTCPSession, PTCP};
 
 static MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
 
@@ -32,8 +31,12 @@ pub async fn p2p_handshake(
     relay_mode: bool,
 ) -> io::Result<(UdpSocket, PTCPSession)> {
     let mut cseq = 0;
+    let start = Instant::now();
 
-    info!("Connecting to P2P service...");
+    info!(
+        "Connecting to P2P service (serial={}, relay={})...",
+        serial, relay_mode
+    );
     socket.connect(MAIN_SERVER).await?;
 
     socket.dh_request("/probe/p2psrv", None, &mut cseq).await;
@@ -63,18 +66,6 @@ pub async fn p2p_handshake(
         )
         .await;
     socket2.dh_read().await;
-
-    /*
-    TODO add support for device info request
-    socket2
-        .dh_request(
-            format!("/info/device/{}", serial).as_ref(),
-            None,
-            &mut cseq,
-        )
-        .await;
-    socket2.dh_read().await;
-    */
 
     let cid: [u8; 8] = rand::random();
 
@@ -127,7 +118,7 @@ pub async fn p2p_handshake(
             error!("Authentication is not supported at this time.");
         }
 
-        panic!("Error response: {}", res.status);
+        return Err(io::Error::new(io::ErrorKind::Other, res.status));
     }
     debug!("Got device info (code {})", res.code);
 
@@ -135,7 +126,6 @@ pub async fn p2p_handshake(
     let device_laddr = &data["body/LocalAddr"];
     let device = &data["body/PubAddr"];
 
-    // not necessary when relay_mode is true, but UDP is connectionless
     socket.connect(device).await?;
 
     let max_retries = 5;
@@ -147,7 +137,6 @@ pub async fn p2p_handshake(
             attempt, max_retries
         );
 
-        // Send the relay-channel request via the main server
         socket2.connect(MAIN_SERVER).await?;
         socket2
             .dh_request(
@@ -157,7 +146,6 @@ pub async fn p2p_handshake(
             )
             .await;
 
-        // Switch to the agent to await the confirmation
         socket2.connect(agent).await?;
         debug!("Waiting for relay channel confirmation...");
 
@@ -177,13 +165,19 @@ pub async fn p2p_handshake(
                         "Failed to confirm relay channel after {} attempts",
                         max_retries
                     );
-                    panic!("Relay channel confirmation timed out");
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Relay channel confirmation timed out",
+                    ));
                 }
             }
         }
     }
 
-    info!("Initiating PTCP session...");
+    info!(
+        "Initiating PTCP session (serial={}, relay={})...",
+        serial, relay_mode
+    );
     let mut session = PTCPSession::new();
 
     socket2
@@ -222,7 +216,10 @@ pub async fn p2p_handshake(
             .join("")
     );
 
-    info!("Establishing direct P2P connection...");
+    info!(
+        "Establishing direct P2P connection (serial={}, relay={})...",
+        serial, relay_mode
+    );
     let cookie: [u8; 4] = rand::random();
     let trans_id: [u8; 12] = rand::random();
     let cid: Vec<u8> = cid.iter().map(|b| !b).collect();
@@ -256,7 +253,7 @@ pub async fn p2p_handshake(
     if result.is_err() {
         warn!("Timeout occurred while waiting for a response from the device.");
         warn!("If the issue persists, you may need to use relay mode (--relay) with this device.");
-        panic!("Timeout");
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "Device response timeout"));
     }
 
     let n = result.unwrap().unwrap();
@@ -293,7 +290,6 @@ pub async fn p2p_handshake(
     socket.send(&data).await?;
     trace!("---");
 
-    // read 5 times
     for _ in 0..5 {
         trace!("<<< {}", socket.peer_addr().unwrap());
         let n = socket.recv(&mut buf).await?;
@@ -351,7 +347,12 @@ pub async fn p2p_handshake(
 
     assert!(matches!(res.body, PTCPBody::Empty), "Invalid response");
 
-    info!("P2P handshake complete");
+    info!(
+        "P2P handshake complete (serial={}, relay={}, elapsed_ms={})",
+        serial,
+        relay_mode,
+        start.elapsed().as_millis()
+    );
     Ok((socket, session))
 }
 
@@ -367,7 +368,6 @@ struct DHResponse {
 
 impl DHResponse {
     fn parse_body(body: &str) -> HashMap<String, String> {
-        // XmlBody::Value("")
         let mut parser = EventReader::from_str(body);
         let mut stack = Vec::new();
         let mut tree = HashMap::new();
@@ -396,7 +396,6 @@ impl DHResponse {
     }
 
     fn parse_response(res: &str) -> DHResponse {
-        // split head and body by "\r\n\r\n"
         let mut parts = res.split("\r\n\r\n");
         let head = parts.next().unwrap();
         let body = parts.next().unwrap();
@@ -457,13 +456,10 @@ impl DHP2P for UdpSocket {
             None => "",
         };
 
-        // random a 32-bit number
         let nonce = rand::random::<u32>();
-        // iso8601 time string
         let currdate = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let pwd = format!("{}{}DHP2P:{}:{}", nonce, currdate, USERNAME, USERKEY);
 
-        // sha1 then base64
         let mut hasher = sha1::Sha1::new();
         hasher.update(pwd);
         let hash_digest = hasher.finalize();
@@ -508,3 +504,4 @@ impl DHP2P for UdpSocket {
         res
     }
 }
+

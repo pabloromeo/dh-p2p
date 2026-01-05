@@ -41,6 +41,10 @@ Options:
           Relay mode (experimental)
   -b, --buffer-ms <ms>
           Jitter buffer duration in milliseconds (0 to disable). Default: 0
+      --drop-policy <policy>
+          Drop policy for slow clients: block|drop_newest|keep_latest (default: block)
+      --health-interval-secs <secs>
+          Interval for periodic health logs (default: 60)
   -v, --verbose...
           Increase verbosity (-v for debug, -vv for trace)
   -h, --help

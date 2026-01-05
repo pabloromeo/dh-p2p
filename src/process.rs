@@ -1,8 +1,11 @@
 use log::{debug, info, warn};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tokio::{
@@ -12,13 +15,14 @@ use tokio::{
 };
 
 use crate::buffer::JitterBuffer;
+use crate::config::DropPolicy;
 use crate::fdlog::log_fd_snapshot;
-use crate::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
 use crate::shutdown::ShutdownReason;
+use crate::transport::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
 
 fn log_fd_state(
     label: &str,
-    channels: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: &Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 ) {
     let (chan_len, conn_len) = {
@@ -29,28 +33,104 @@ fn log_fd_state(
     log_fd_snapshot(label, chan_len, conn_len);
 }
 
+#[derive(Clone)]
+pub struct ClientChannel {
+    buffer: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
+    not_empty: Arc<tokio::sync::Notify>,
+    space_available: Arc<tokio::sync::Notify>,
+}
+
+impl ClientChannel {
+    pub fn new() -> Self {
+        ClientChannel {
+            buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            not_empty: Arc::new(tokio::sync::Notify::new()),
+            space_available: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub async fn push(
+        &self,
+        data: Vec<u8>,
+        capacity: usize,
+        drop_policy: DropPolicy,
+        realm: u32,
+        health: &HealthCounters,
+    ) {
+        loop {
+            let mut buf = self.buffer.lock().await;
+            if buf.len() < capacity {
+                buf.push_back(data);
+                self.not_empty.notify_one();
+                return;
+            }
+
+            match drop_policy {
+                DropPolicy::Block => {
+                    // Release lock and wait for space to be available
+                    drop(buf);
+                    self.space_available.notified().await;
+                }
+                DropPolicy::DropNewest => {
+                    warn!(
+                        "Realm {:08x} dropping newest frame due to full buffer (DropNewest)",
+                        realm
+                    );
+                    health.drops_newest.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                DropPolicy::DropOldestKeepLatest => {
+                    if let Some(_dropped) = buf.pop_front() {
+                        warn!(
+                            "Realm {:08x} dropped oldest frame to keep latest (DropOldestKeepLatest)",
+                            realm
+                        );
+                        health.drops_oldest.fetch_add(1, Ordering::Relaxed);
+                    }
+                    buf.push_back(data);
+                    self.not_empty.notify_one();
+                    return;
+                }
+            }
+        }
+    }
+
+    pub async fn recv(&self, shutdown: &mut watch::Receiver<ShutdownReason>) -> Option<Vec<u8>> {
+        loop {
+            {
+                let mut buf = self.buffer.lock().await;
+                if let Some(data) = buf.pop_front() {
+                    // Notify potential producers waiting for space
+                    self.space_available.notify_one();
+                    return Some(data);
+                }
+            }
+
+            tokio::select! {
+                _ = self.not_empty.notified() => { /* retry loop */ }
+                _ = shutdown.changed() => return None,
+            }
+        }
+    }
+}
+
 /**
  * Read data from the channel and write it back to the client
  */
 pub async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    channel: ClientChannel,
     mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     loop {
-        tokio::select! {
-            data = rx.recv() => {
-                match data {
-                    Some(data) => {
-                        if writer.write_all(&data).await.is_err() {
-                            warn!("Writer: Socket closed by peer.");
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            _ = shutdown.changed() => break,
+        let data = match channel.recv(&mut shutdown).await {
+            Some(d) => d,
+            None => break,
+        };
+
+        if writer.write_all(&data).await.is_err() {
+            warn!("Writer: Socket closed by peer.");
+            break;
         }
     }
 }
@@ -66,6 +146,11 @@ pub async fn process_reader(
     mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     let mut buf = [0u8; 4096];
+    info!(
+        "Reader started for realm {:08x} (client {})",
+        realm_id, peer
+    );
+    let mut stop_reason = "shutdown";
 
     loop {
         let n = tokio::select! {
@@ -77,6 +162,7 @@ pub async fn process_reader(
                                 "Reader: socket closed by peer {} (realm {:08x})",
                                 peer, realm_id
                             );
+                            stop_reason = "peer_closed";
                             let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                             break;
                         }
@@ -87,12 +173,16 @@ pub async fn process_reader(
                             "Reader error from {} (realm {:08x}): {}",
                             peer, realm_id, e
                         );
+                        stop_reason = "read_error";
                         let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                         break;
                     }
                 }
             }
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                stop_reason = "shutdown_signal";
+                break
+            },
         };
 
         if dh_tx
@@ -103,6 +193,10 @@ pub async fn process_reader(
             break;
         }
     }
+    info!(
+        "Reader stopped for realm {:08x} (client {}, reason={})",
+        realm_id, peer, stop_reason
+    );
 }
 
 /**
@@ -115,8 +209,9 @@ pub async fn dh_writer(
     remote_port: u32,
     mut shutdown: watch::Receiver<ShutdownReason>,
     shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
-    channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    health: Arc<HealthCounters>,
 ) {
     loop {
         let ev = tokio::select! {
@@ -142,6 +237,10 @@ pub async fn dh_writer(
                     .lock()
                     .unwrap()
                     .send(PTCPBody::Bind(realm, remote_port));
+                info!(
+                    "Realm {:08x}: sending PTCP bind (remote_port={})",
+                    realm, remote_port
+                );
                 if let Err(e) = socket.ptcp_request(p).await {
                     log::error!(
                         "PTCP bind send error for realm {:08x}: {}",
@@ -172,13 +271,16 @@ pub async fn dh_writer(
                 }
                 let removed_chan = channels.lock().unwrap().remove(&realm).is_some();
                 let removed_conn = conn_channels.lock().unwrap().remove(&realm).is_some();
+                let remaining = channels.lock().unwrap().len();
                 info!(
-                    "Realm {:08x} client disconnect cleanup: channel_removed={}, conn_removed={}",
-                    realm, removed_chan, removed_conn
+                    "Realm {:08x} client disconnect cleanup: channel_removed={}, conn_removed={}, remaining_realms={}",
+                    realm, removed_chan, removed_conn, remaining
                 );
                 log_fd_state("dh_writer disconnect", &channels, &conn_channels);
             }
             PTCPEvent::Data(realm, data) => {
+                health.bytes_to_device.fetch_add(data.len() as u64, Ordering::Relaxed);
+                health.packets_to_device.fetch_add(1, Ordering::Relaxed);
                 let p = session
                     .lock()
                     .unwrap()
@@ -202,7 +304,10 @@ pub async fn dh_writer(
 /// Send packets to their respective client channels
 async fn send_to_clients(
     packets: Vec<(u32, Vec<u8>)>,
-    channels: &Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    drop_policy: DropPolicy,
+    capacity: usize,
+    health: &Arc<HealthCounters>,
 ) {
     for (realm, data) in packets {
         let tx = {
@@ -210,20 +315,42 @@ async fn send_to_clients(
             chans.get(&realm).cloned()
         };
         if let Some(tx) = tx {
-            // Use try_send to detect backpressure
-            match tx.try_send(data) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(data)) => {
-                    // Channel full - client can't keep up, force send anyway
-                    warn!("Realm {:08x} channel full (backpressure), client may be slow", realm);
-                    let _ = tx.send(data).await;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    warn!("Realm {:08x} channel closed", realm);
-                }
-            }
+            tx.push(data, capacity, drop_policy.clone(), realm, health)
+                .await;
         }
     }
+}
+
+fn update_max(atomic: &AtomicU64, value: u64) {
+    let mut current = atomic.load(Ordering::Relaxed);
+    while value > current {
+        match atomic.compare_exchange(
+            current,
+            value,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct HealthCounters {
+    pub bytes_from_device: AtomicU64,
+    pub bytes_to_device: AtomicU64,
+    pub packets_from_device: AtomicU64,
+    pub packets_to_device: AtomicU64,
+    pub drops_newest: AtomicU64,
+    pub drops_oldest: AtomicU64,
+    pub jitter_enabled: AtomicBool,
+    pub jitter_in_packets: AtomicU64,
+    pub jitter_in_bytes: AtomicU64,
+    pub jitter_out_packets: AtomicU64,
+    pub jitter_out_bytes: AtomicU64,
+    pub jitter_late_drops: AtomicU64,
+    pub jitter_max_depth: AtomicU64,
 }
 
 /**
@@ -232,19 +359,25 @@ async fn send_to_clients(
 pub async fn dh_reader(
     session: Arc<Mutex<PTCPSession>>,
     socket: Arc<UdpSocket>,
-    channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     mut shutdown: watch::Receiver<ShutdownReason>,
     shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
     last_activity: Arc<Mutex<std::time::Instant>>,
+    drop_policy: DropPolicy,
     buffer_ms: u64,
+    channel_capacity: usize,
+    health: Arc<HealthCounters>,
 ) {
     // Create jitter buffer if enabled
     let mut jitter_buffer = if buffer_ms > 0 {
-        Some(JitterBuffer::new(Duration::from_millis(buffer_ms)))
+        let jb = JitterBuffer::new(Duration::from_millis(buffer_ms));
+        health.jitter_enabled.store(true, Ordering::Relaxed);
+        Some(jb)
     } else {
         None
     };
+    let mut last_late_dropped: u64 = 0;
 
     // Create a tick interval for the buffer (runs every 10ms)
     let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
@@ -279,7 +412,7 @@ pub async fn dh_reader(
                 match packet.body {
                     PTCPBody::Status(realm, status) => {
                         if status == "CONN" {
-                            info!("Realm {:08x} streaming ready", realm);
+                            info!("Realm {:08x} streaming ready; notifying waiter", realm);
                             if let Some(sender) = conn_channels.lock().unwrap().remove(&realm) {
                                 let _ = sender.send(true);
                             } else {
@@ -289,7 +422,10 @@ pub async fn dh_reader(
                         } else if status == "DISC" || status.starts_with("DISC") {
                             let removed = channels.lock().unwrap().remove(&realm);
                             if removed.is_some() {
-                                warn!("Realm {:08x} device sent DISC", realm);
+                                warn!(
+                                    "Realm {:08x} device sent DISC; removing client channel",
+                                    realm
+                                );
                                 log_fd_state("dh_reader device disc", &channels, &conn_channels);
                             } else {
                                 debug!("Realm {:08x} device sent DISC (already removed)", realm);
@@ -299,21 +435,60 @@ pub async fn dh_reader(
                         }
                     }
                     PTCPBody::Payload(payload) => {
+                        let payload_len = payload.data.len() as u64;
+                        if jitter_buffer.is_some() {
+                            health
+                                .jitter_in_packets
+                                .fetch_add(1, Ordering::Relaxed);
+                            health.jitter_in_bytes.fetch_add(payload_len, Ordering::Relaxed);
+                        }
+                        health.bytes_from_device.fetch_add(
+                            payload.data.len() as u64,
+                            Ordering::Relaxed,
+                        );
+                        health.packets_from_device.fetch_add(1, Ordering::Relaxed);
                         if let Some(ref mut buffer) = jitter_buffer {
                             // Insert and get ready packets
                             let ready = buffer.insert(seq, payload.realm, payload.data);
+                            let late_now = buffer.late_dropped();
+                            let late_delta = late_now.saturating_sub(last_late_dropped);
+                            if late_delta > 0 {
+                                health
+                                    .jitter_late_drops
+                                    .fetch_add(late_delta, Ordering::Relaxed);
+                                last_late_dropped = late_now;
+                            }
+                            let depth = buffer.buffered_len() as u64;
+                            update_max(&health.jitter_max_depth, depth);
                             if !ready.is_empty() {
-                                send_to_clients(ready, &channels).await;
+                                let ready_bytes: u64 =
+                                    ready.iter().map(|(_, d)| d.len() as u64).sum();
+                                health
+                                    .jitter_out_packets
+                                    .fetch_add(ready.len() as u64, Ordering::Relaxed);
+                                health
+                                    .jitter_out_bytes
+                                    .fetch_add(ready_bytes, Ordering::Relaxed);
+                                send_to_clients(
+                                    ready,
+                                    &channels,
+                                    drop_policy.clone(),
+                                    channel_capacity,
+                                    &health,
+                                )
+                                .await;
                             }
                         } else {
                             // No buffering - send directly
-                            let tx = {
-                                let chans = channels.lock().unwrap();
-                                chans.get(&payload.realm).cloned()
-                            };
-                            if let Some(tx) = tx {
-                                let _ = tx.send(payload.data).await;
-                            }
+                            let packets = vec![(payload.realm, payload.data)];
+                            send_to_clients(
+                                packets,
+                                &channels,
+                                drop_policy.clone(),
+                                channel_capacity,
+                                &health,
+                            )
+                            .await;
                         }
                     }
                     _ => {}
@@ -325,7 +500,22 @@ pub async fn dh_reader(
                 if let Some(ref mut buffer) = jitter_buffer {
                     let ready = buffer.tick();
                     if !ready.is_empty() {
-                        send_to_clients(ready, &channels).await;
+                        let ready_bytes: u64 =
+                            ready.iter().map(|(_, d)| d.len() as u64).sum();
+                        health
+                            .jitter_out_packets
+                            .fetch_add(ready.len() as u64, Ordering::Relaxed);
+                        health
+                            .jitter_out_bytes
+                            .fetch_add(ready_bytes, Ordering::Relaxed);
+                        send_to_clients(
+                            ready,
+                            &channels,
+                            drop_policy.clone(),
+                            channel_capacity,
+                            &health,
+                        )
+                        .await;
                     }
                 }
             }
@@ -334,11 +524,138 @@ pub async fn dh_reader(
             _ = shutdown.changed() => {
                 if let Some(ref mut buffer) = jitter_buffer {
                     let remaining = buffer.flush_all();
-                    send_to_clients(remaining, &channels).await;
+                    let remaining_bytes: u64 =
+                        remaining.iter().map(|(_, d)| d.len() as u64).sum();
+                    health
+                        .jitter_out_packets
+                        .fetch_add(remaining.len() as u64, Ordering::Relaxed);
+                    health
+                        .jitter_out_bytes
+                        .fetch_add(remaining_bytes, Ordering::Relaxed);
+                    send_to_clients(
+                        remaining,
+                        &channels,
+                        drop_policy.clone(),
+                        channel_capacity,
+                        &health,
+                    )
+                    .await;
                     buffer.log_stats();
                 }
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn drop_policy_drop_newest_drops_when_full() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let channel = ClientChannel::new();
+        channels.lock().unwrap().insert(1, channel.clone());
+        let health = Arc::new(HealthCounters::default());
+
+        // Fill the channel
+        send_to_clients(
+            vec![(1, b"a".to_vec())],
+            &channels,
+            DropPolicy::DropNewest,
+            1,
+            &health,
+        )
+        .await;
+        // Second send should drop
+        send_to_clients(
+            vec![(1, b"b".to_vec())],
+            &channels,
+            DropPolicy::DropNewest,
+            1,
+            &health,
+        )
+        .await;
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let first = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(first, b"a");
+        // Trigger shutdown so the second recv unblocks and returns None
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
+        assert!(matches!(channel.recv(&mut shutdown_rx).await, None));
+    }
+
+    #[tokio::test]
+    async fn drop_policy_drop_oldest_keep_latest_keeps_newest() {
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        channel
+            .push(
+                b"a".to_vec(),
+                1,
+                DropPolicy::DropOldestKeepLatest,
+                1,
+                &health,
+            )
+            .await;
+        channel
+            .push(
+                b"b".to_vec(),
+                1,
+                DropPolicy::DropOldestKeepLatest,
+                1,
+                &health,
+            )
+            .await;
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let first = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(first, b"b");
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
+    }
+
+    #[tokio::test]
+    async fn drop_policy_block_waits_until_space_available() {
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        channel
+            .push(b"a".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let channel_block = channel.clone();
+        let health_block = health.clone();
+        tokio::spawn(async move {
+            channel_block
+                .push(b"b".to_vec(), 1, DropPolicy::Block, 1, &*health_block)
+                .await;
+            let _ = done_tx.send(());
+        });
+
+        // Should not complete while buffer is full
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut done_rx)
+                .await
+                .is_err()
+        );
+
+        let (shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let first = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(first, b"a");
+
+        // Now the second push can complete
+        tokio::time::timeout(Duration::from_millis(200), &mut done_rx)
+            .await
+            .expect("push should complete after space frees")
+            .expect("push task join failed");
+
+        let second = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(second, b"b");
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
     }
 }

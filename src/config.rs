@@ -1,0 +1,58 @@
+#[derive(Clone, Debug)]
+pub enum DropPolicy {
+    /// Block on backpressure (current behavior)
+    Block,
+    /// Drop the newest frame when the queue is full
+    DropNewest,
+    /// Drop the oldest frame and keep the latest
+    DropOldestKeepLatest,
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub heartbeat_interval_secs: u64,
+    pub heartbeat_missed_limit: u64,
+    pub heartbeat_timeout_grace_secs: u64,
+    pub health_interval_secs: u64,
+    pub restart_backoff_initial_secs: u64,
+    pub restart_backoff_max_secs: u64,
+    pub restart_backoff_jitter_ms: u64,
+    pub handshake_timeout_secs: u64,
+    pub realm_ready_timeout_secs: u64,
+    pub channel_capacity: usize,
+    pub drop_policy: DropPolicy,
+    pub jitter_buffer_ms: u64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_secs: 2,
+            heartbeat_missed_limit: 2,
+            heartbeat_timeout_grace_secs: 2,
+            health_interval_secs: 60,
+            restart_backoff_initial_secs: 1,
+            restart_backoff_max_secs: 30,
+            restart_backoff_jitter_ms: 500,
+            handshake_timeout_secs: 15,
+            realm_ready_timeout_secs: 10,
+            channel_capacity: 128,
+            drop_policy: DropPolicy::Block,
+            jitter_buffer_ms: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DropPolicy;
+
+    #[test]
+    fn drop_policy_variants_exist() {
+        let _a = DropPolicy::Block;
+        let _b = DropPolicy::DropNewest;
+        let _c = DropPolicy::DropOldestKeepLatest;
+    }
+}
+
+

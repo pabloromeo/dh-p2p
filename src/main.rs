@@ -1,9 +1,8 @@
 use clap::Parser;
 use log::{debug, info, warn};
-use rand::Rng;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
 #[cfg(unix)]
@@ -15,27 +14,24 @@ use tokio::{
 };
 
 use crate::{
-    dh::p2p_handshake,
+    config::{Config, DropPolicy},
     fdlog::log_fd_snapshot,
-    process::{dh_reader, dh_writer, process_reader, process_writer},
-    ptcp::PTCPEvent,
+    metrics::{InMemoryMetrics, MetricsHandle},
+    process::{
+        dh_reader, dh_writer, process_reader, process_writer, ClientChannel, HealthCounters,
+    },
     shutdown::ShutdownReason,
+    transport::{handshake::p2p_handshake, ptcp::PTCPEvent},
 };
 
 mod buffer;
-mod dh;
+mod config;
 mod fdlog;
+mod metrics;
 mod process;
-mod ptcp;
 mod shutdown;
-
-const HEARTBEAT_INTERVAL_SECS: u64 = 5;
-const HEARTBEAT_MISSED_LIMIT: u64 = 2;
-const HEARTBEAT_TIMEOUT_SECS: u64 = HEARTBEAT_INTERVAL_SECS * HEARTBEAT_MISSED_LIMIT + 2; // small grace
-const RESTART_BACKOFF_INITIAL_SECS: u64 = 1;
-const RESTART_BACKOFF_MAX_SECS: u64 = 30;
-const RESTART_BACKOFF_JITTER_MS: u64 = 500;
-const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+mod supervisor;
+mod transport;
 
 #[derive(Parser)]
 #[command(about = "A PoC implementation of TCP tunneling over Dahua P2P protocol.", long_about = None)]
@@ -49,6 +45,12 @@ struct Cli {
     /// Jitter buffer duration in milliseconds (0 to disable). Default: 0
     #[arg(short = 'b', long, value_name = "ms", default_value = "0")]
     buffer_ms: u64,
+    /// Drop policy for slow clients: block|drop_newest|keep_latest
+    #[arg(long, value_name = "policy", default_value = "block")]
+    drop_policy: String,
+    /// Health log interval in seconds
+    #[arg(long, value_name = "secs", default_value = "60")]
+    health_interval_secs: u64,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -76,6 +78,17 @@ async fn main() {
 
     let serial = args.serial;
     let port = args.port.unwrap_or("127.0.0.1:1554:554".to_string());
+    let mut config = Config::default();
+    config.jitter_buffer_ms = args.buffer_ms;
+    config.health_interval_secs = args.health_interval_secs;
+    config.drop_policy = match args.drop_policy.as_str() {
+        "block" => DropPolicy::Block,
+        "drop_newest" => DropPolicy::DropNewest,
+        "keep_latest" => DropPolicy::DropOldestKeepLatest,
+        other => panic!("Invalid drop_policy: {}", other),
+    };
+    let config = Arc::new(config);
+    let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
 
     let parts: Vec<&str> = port.split(':').collect();
     let (bind_address, bind_port, remote_port): (&str, u16, u16) = match parts.len() {
@@ -92,39 +105,41 @@ async fn main() {
         _ => panic!("Invalid port specification"),
     };
 
-    let mut iteration: u64 = 0;
-    let mut backoff_secs: u64 = RESTART_BACKOFF_INITIAL_SECS;
-    loop {
-        iteration += 1;
-        info!("Starting server iteration {}", iteration);
-        let reason = run_server_once(
-            bind_address.to_string(),
-            bind_port,
-            remote_port,
-            serial.clone(),
-            args.relay,
-            args.buffer_ms,
-        )
-        .await;
-
-        match reason {
-            ShutdownReason::Stop => {
-                info!("Shutdown reason: Stop (iteration {})", iteration);
-                break;
-            }
-            ShutdownReason::Restart => {
-                warn!(
-                    "Shutdown reason: Restart requested, re-handshaking... (iteration {}), backoff {}s",
-                    iteration, backoff_secs
-                );
-                let jitter_ms = rand::thread_rng().gen_range(0..=RESTART_BACKOFF_JITTER_MS);
-                let sleep_dur =
-                    Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms);
-                tokio::time::sleep(sleep_dur).await;
-                backoff_secs = (backoff_secs.saturating_mul(2)).min(RESTART_BACKOFF_MAX_SECS);
-            }
-        }
-    }
+    supervisor::run_loop(
+        bind_address.to_string(),
+        bind_port,
+        remote_port,
+        serial,
+        args.relay,
+        args.buffer_ms,
+        config.clone(),
+        metrics.clone(),
+        |bind_address,
+         bind_port,
+         remote_port,
+         serial,
+         relay,
+         buffer_ms,
+         config,
+         metrics,
+         shutdown_tx,
+         shutdown_rx| async move {
+            run_server_once(
+                bind_address,
+                bind_port,
+                remote_port,
+                serial,
+                relay,
+                buffer_ms,
+                config,
+                metrics,
+                shutdown_tx,
+                shutdown_rx,
+            )
+            .await
+        },
+    )
+    .await;
 }
 
 async fn run_server_once(
@@ -134,6 +149,10 @@ async fn run_server_once(
     serial: String,
     relay: bool,
     buffer_ms: u64,
+    config: Arc<Config>,
+    metrics: MetricsHandle,
+    shutdown_tx_external: Arc<watch::Sender<ShutdownReason>>,
+    shutdown_rx_external: watch::Receiver<ShutdownReason>,
 ) -> ShutdownReason {
     // Bind the listener to the address
     let listener = TcpListener::bind(format!("{}:{}", bind_address, bind_port))
@@ -149,8 +168,8 @@ async fn run_server_once(
     };
 
     let handshake = tokio::time::timeout(
-        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        p2p_handshake(socket, serial, relay),
+        Duration::from_secs(config.handshake_timeout_secs),
+        p2p_handshake(socket, serial.clone(), relay),
     )
     .await;
 
@@ -158,27 +177,34 @@ async fn run_server_once(
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
             warn!("P2P handshake failed: {}", e);
+            metrics.inc_counter("handshake_fail");
             return ShutdownReason::Restart;
         }
         Err(_) => {
             warn!(
                 "P2P handshake timed out after {}s",
-                HANDSHAKE_TIMEOUT_SECS
+                config.handshake_timeout_secs
             );
+            metrics.inc_counter("handshake_timeout");
             return ShutdownReason::Restart;
         }
     };
 
-    let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(128);
-    let (shutdown_tx, shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
-    let shutdown_tx = Arc::new(shutdown_tx);
+    let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(config.channel_capacity);
+    let shutdown_tx = shutdown_tx_external.clone();
+    let shutdown_rx = shutdown_rx_external;
     let session = Arc::new(Mutex::new(session));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
+    let health = Arc::new(HealthCounters::default());
 
-    let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
+    let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
 
-    info!("PTCP session established");
+    info!(
+        "PTCP session established (serial={}, relay={}, remote_port={})",
+        serial, relay, remote_port
+    );
+    metrics.inc_counter("handshake_success");
 
     /*
      * Clone the handles
@@ -229,10 +255,11 @@ async fn run_server_once(
 
     let mut hb_shutdown = shutdown_rx.clone();
     let hb_tx = dh_tx.clone();
+    let hb_config = config.clone();
     let heartbeat_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) => {
+                _ = tokio::time::sleep(Duration::from_secs(hb_config.heartbeat_interval_secs)) => {
                     if hb_tx.send(PTCPEvent::Heartbeat).await.is_err() {
                         break;
                     }
@@ -248,6 +275,7 @@ async fn run_server_once(
     let writer_channels = Arc::clone(&channels2);
     let writer_conn_channels = Arc::clone(&conn_channels2);
     let shutdown_tx_writer = shutdown_tx.clone();
+    let health_writer = health.clone();
     let writer_handle = tokio::spawn(async move {
         dh_writer(
             session,
@@ -258,6 +286,7 @@ async fn run_server_once(
             shutdown_tx_writer,
             writer_channels,
             writer_conn_channels,
+            health_writer,
         )
         .await;
     });
@@ -265,6 +294,9 @@ async fn run_server_once(
     let reader_shutdown = shutdown_rx.clone();
     let shutdown_tx_reader = shutdown_tx.clone();
     let last_activity_reader = last_activity.clone();
+    let drop_policy = config.drop_policy.clone();
+    let channel_capacity = config.channel_capacity;
+    let health_reader = health.clone();
     let reader_handle = tokio::spawn(async move {
         dh_reader(
             session2,
@@ -274,7 +306,10 @@ async fn run_server_once(
             reader_shutdown,
             shutdown_tx_reader,
             last_activity_reader,
+            drop_policy,
             buffer_ms,
+            channel_capacity,
+            health_reader,
         )
         .await;
     });
@@ -283,14 +318,19 @@ async fn run_server_once(
     let mut watchdog_shutdown = shutdown_rx.clone();
     let shutdown_tx_watchdog = shutdown_tx.clone();
     let last_activity_watchdog = last_activity.clone();
+    let watchdog_config = config.clone();
     let watchdog_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(watchdog_config.heartbeat_interval_secs));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     let last = *last_activity_watchdog.lock().unwrap();
-                    let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
+                    let timeout = Duration::from_secs(
+                        watchdog_config.heartbeat_interval_secs * watchdog_config.heartbeat_missed_limit
+                            + watchdog_config.heartbeat_timeout_grace_secs,
+                    );
                     if last.elapsed() >= timeout {
                         warn!("No PTCP activity for {:?}, requesting restart", timeout);
                         let _ = shutdown_tx_watchdog.send(ShutdownReason::Restart);
@@ -302,7 +342,73 @@ async fn run_server_once(
         }
     });
 
-    info!("Ready to connect!");
+    // Periodic health snapshot (info-level)
+    let mut health_shutdown = shutdown_rx.clone();
+    let health_channels = channels2.clone();
+    let health_conn_channels = conn_channels2.clone();
+    let health_counters = health.clone();
+    let health_interval_secs = config.health_interval_secs;
+    let health_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(health_interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let realms = health_channels.lock().unwrap().len();
+                    let waiters = health_conn_channels.lock().unwrap().len();
+                    let bytes_in = health_counters.bytes_from_device.swap(0, Ordering::Relaxed);
+                    let bytes_out = health_counters.bytes_to_device.swap(0, Ordering::Relaxed);
+                    let pkts_in = health_counters.packets_from_device.swap(0, Ordering::Relaxed);
+                    let pkts_out = health_counters.packets_to_device.swap(0, Ordering::Relaxed);
+                    let drops_newest = health_counters.drops_newest.swap(0, Ordering::Relaxed);
+                    let drops_oldest = health_counters.drops_oldest.swap(0, Ordering::Relaxed);
+                    let interval = health_interval_secs as u64;
+                    let in_bps = bytes_in / interval;
+                    let out_bps = bytes_out / interval;
+                    let jitter_in_pkts = health_counters
+                        .jitter_in_packets
+                        .swap(0, Ordering::Relaxed);
+                    let jitter_out_pkts = health_counters
+                        .jitter_out_packets
+                        .swap(0, Ordering::Relaxed);
+                    let jitter_in_bytes =
+                        health_counters.jitter_in_bytes.swap(0, Ordering::Relaxed);
+                    let jitter_out_bytes =
+                        health_counters.jitter_out_bytes.swap(0, Ordering::Relaxed);
+                    let jitter_late_drops =
+                        health_counters.jitter_late_drops.swap(0, Ordering::Relaxed);
+                    let jitter_max_depth =
+                        health_counters.jitter_max_depth.swap(0, Ordering::Relaxed);
+                    info!(
+                        "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={}",
+                        realms,
+                        waiters,
+                        bytes_in,
+                        bytes_out,
+                        in_bps,
+                        out_bps,
+                        pkts_in,
+                        pkts_out,
+                        drops_newest,
+                        drops_oldest,
+                        health_counters.jitter_enabled.load(Ordering::Relaxed),
+                        jitter_in_pkts,
+                        jitter_out_pkts,
+                        jitter_in_bytes,
+                        jitter_out_bytes,
+                        jitter_late_drops,
+                        jitter_max_depth,
+                    );
+                }
+                _ = health_shutdown.changed() => break,
+            }
+        }
+    });
+
+    info!(
+        "Ready to accept TCP clients on {}:{} (remote_port={}, buffer_ms={}, drop_policy={:?})",
+        bind_address, bind_port, remote_port, buffer_ms, config.drop_policy
+    );
     if remote_port == 554 {
         info!(
             "RTSP URL: rtsp://127.0.0.1{}/cam/realmonitor?channel=1&subtype=0",
@@ -333,13 +439,15 @@ async fn run_server_once(
                 break;
             }
         };
-        info!("Accepted connection from {} (new client)", addr);
+        let client_connected_at = Instant::now();
+        info!("Accepted TCP client {}", addr);
+        metrics.inc_counter("client_accept");
 
         // Create a channel for the client
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+        let channel = ClientChannel::new();
         let (conn_tx, conn_rx) = oneshot::channel::<bool>();
         let dh_tx = dh_tx.clone();
-        let mut shutdown_conn = shutdown_rx.clone();
+        let _shutdown_conn = shutdown_rx.clone();
 
         let realm_id = rand::random::<u32>();
         info!(
@@ -348,7 +456,7 @@ async fn run_server_once(
         );
 
         // Store the channel in the map
-        channels2.lock().unwrap().insert(realm_id, tx);
+        channels2.lock().unwrap().insert(realm_id, channel.clone());
         conn_channels2.lock().unwrap().insert(realm_id, conn_tx);
         {
             let chans = channels2.lock().unwrap();
@@ -365,23 +473,42 @@ async fn run_server_once(
             "Waiting for realm {:08x} to become ready (client {})",
             realm_id, addr
         );
-        tokio::select! {
-            res = conn_rx => {
+        let ready = tokio::time::timeout(
+            Duration::from_secs(config.realm_ready_timeout_secs),
+            conn_rx,
+        )
+        .await;
+        match ready {
+            Ok(res) => {
                 if res.is_err() {
-                    warn!("Realm {:08x} connection handshake failed", realm_id);
+                    warn!(
+                        "Realm {:08x} connection handshake failed after {}ms (client {})",
+                        realm_id,
+                        client_connected_at.elapsed().as_millis(),
+                        addr
+                    );
+                    metrics.inc_counter("realm_ready_failed");
+                    channels2.lock().unwrap().remove(&realm_id);
+                    conn_channels2.lock().unwrap().remove(&realm_id);
                     continue;
                 }
                 info!(
-                    "Realm {:08x} ready; starting reader/writer tasks for client {}",
-                    realm_id, addr
+                    "Realm {:08x} ready after {}ms; starting reader/writer tasks for client {}",
+                    realm_id,
+                    client_connected_at.elapsed().as_millis(),
+                    addr
                 );
+                metrics.inc_counter("realm_ready");
             }
-            _ = shutdown_conn.changed() => {
-                info!(
-                    "Shutdown before realm {:08x} became ready (client {})",
-                    realm_id, addr
+            Err(_) => {
+                warn!(
+                    "Realm {:08x} ready wait timed out after {}s (client {}, elapsed_ms={})",
+                    realm_id,
+                    config.realm_ready_timeout_secs,
+                    addr,
+                    client_connected_at.elapsed().as_millis()
                 );
-                // Remove partially registered realm before continuing
+                metrics.inc_counter("realm_ready_timeout");
                 channels2.lock().unwrap().remove(&realm_id);
                 conn_channels2.lock().unwrap().remove(&realm_id);
                 continue;
@@ -393,6 +520,7 @@ async fn run_server_once(
         tokio::spawn({
             let shutdown_rx = shutdown_rx.clone();
             let peer = addr;
+            let dh_tx = dh_tx.clone();
             async move {
                 process_reader(reader, realm_id, peer, dh_tx, shutdown_rx).await;
             }
@@ -400,8 +528,9 @@ async fn run_server_once(
 
         tokio::spawn({
             let shutdown_rx = shutdown_rx.clone();
+            let channel = channel.clone();
             async move {
-                process_writer(writer, rx, shutdown_rx).await;
+                process_writer(writer, channel, shutdown_rx).await;
             }
         });
     }
@@ -409,7 +538,8 @@ async fn run_server_once(
     // If we exited the accept loop without observing the latest reason, read it now.
     shutdown_reason = *shutdown_rx.borrow();
 
-    info!("Sending PTCP disconnect to active realms");
+    let realm_count = channels2.lock().unwrap().len();
+    info!("Sending PTCP disconnect to {} active realms", realm_count);
     let realms: Vec<u32> = channels2.lock().unwrap().keys().copied().collect();
     for realm in realms {
         if dh_tx.send(PTCPEvent::Disconnect(realm)).await.is_err() {
@@ -426,6 +556,7 @@ async fn run_server_once(
     let _ = reader_handle.await;
     let _ = fd_monitor_handle.await;
     let _ = watchdog_handle.await;
+    let _ = health_handle.await;
 
     if shutdown_reason == ShutdownReason::Restart {
         shutdown_handle.abort();

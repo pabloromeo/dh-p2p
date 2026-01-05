@@ -117,4 +117,12 @@ impl JitterBuffer {
             self.buffer.len()
         );
     }
+
+    pub fn late_dropped(&self) -> u64 {
+        self.late_dropped
+    }
+
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
 }
