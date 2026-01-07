@@ -53,7 +53,7 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new(max_delay: Duration) -> Self {
-        info!("JitterBuffer: max_delay={}ms (wraparound-safe)", max_delay.as_millis());
+        info!("JitterBuffer: max_delay={}ms", max_delay.as_millis());
         JitterBuffer {
             base_seq: None,
             buffer: BTreeMap::new(),
