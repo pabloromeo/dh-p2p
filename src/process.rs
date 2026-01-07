@@ -38,6 +38,8 @@ pub struct ClientChannel {
     buffer: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
     not_empty: Arc<tokio::sync::Notify>,
     space_available: Arc<tokio::sync::Notify>,
+    /// Flag to mark the channel as closed, preventing further pushes
+    closed: Arc<AtomicBool>,
 }
 
 impl ClientChannel {
@@ -46,7 +48,20 @@ impl ClientChannel {
             buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             not_empty: Arc::new(tokio::sync::Notify::new()),
             space_available: Arc::new(tokio::sync::Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Mark the channel as closed, preventing further pushes
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        // Wake up any blocked push() calls so they can see the closed flag
+        self.space_available.notify_waiters();
+    }
+
+    /// Check if the channel is closed
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     pub async fn push(
@@ -57,7 +72,19 @@ impl ClientChannel {
         realm: u32,
         health: &HealthCounters,
     ) {
+        // Check if channel is closed before pushing
+        if self.is_closed() {
+            debug!("Realm {:08x}: push skipped - channel closed", realm);
+            return;
+        }
+
         loop {
+            // Re-check closed flag on each iteration (for Block policy waits)
+            if self.is_closed() {
+                debug!("Realm {:08x}: push aborted - channel closed during wait", realm);
+                return;
+            }
+
             let mut buf = self.buffer.lock().await;
             if buf.len() < capacity {
                 buf.push_back(data);
@@ -68,8 +95,28 @@ impl ClientChannel {
             match drop_policy {
                 DropPolicy::Block => {
                     // Release lock and wait for space to be available
+                    // Use a timeout to prevent indefinite blocking if consumer dies
                     drop(buf);
-                    self.space_available.notified().await;
+                    const BLOCK_TIMEOUT_SECS: u64 = 5;
+                    match tokio::time::timeout(
+                        Duration::from_secs(BLOCK_TIMEOUT_SECS),
+                        self.space_available.notified(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            // Got notification, retry push in next loop iteration
+                            // The notification might be because channel was closed
+                        }
+                        Err(_) => {
+                            warn!(
+                                "Realm {:08x}: push blocked for {}s, dropping frame to prevent deadlock",
+                                realm, BLOCK_TIMEOUT_SECS
+                            );
+                            health.drops_newest.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                 }
                 DropPolicy::DropNewest => {
                     warn!(
@@ -103,6 +150,10 @@ impl ClientChannel {
                     // Notify potential producers waiting for space
                     self.space_available.notify_one();
                     return Some(data);
+                }
+                // If buffer is empty and channel is closed, no more data will arrive
+                if self.is_closed() {
+                    return None;
                 }
             }
 
@@ -269,7 +320,15 @@ pub async fn dh_writer(
                         break;
                     }
                 }
-                let removed_chan = channels.lock().unwrap().remove(&realm).is_some();
+                // Close the channel BEFORE removing from map to prevent race condition
+                // where dh_reader continues pushing to a channel that's being removed
+                let removed_chan = {
+                    let mut chans = channels.lock().unwrap();
+                    if let Some(channel) = chans.get(&realm) {
+                        channel.close();
+                    }
+                    chans.remove(&realm).is_some()
+                };
                 let removed_conn = conn_channels.lock().unwrap().remove(&realm).is_some();
                 let remaining = channels.lock().unwrap().len();
                 info!(
@@ -387,7 +446,23 @@ pub async fn dh_reader(
     loop {
         tokio::select! {
             // Handle incoming packets
-            packet = socket.ptcp_read() => {
+            result = socket.ptcp_read() => {
+                let packet = match result {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Handle read errors
+                        if e.is_fatal() {
+                            warn!("PTCP fatal read error: {}, triggering restart", e);
+                            let _ = shutdown_tx.send(ShutdownReason::Restart);
+                            break;
+                        }
+                        // Non-fatal errors (malformed packets) - log and continue
+                        // Don't update session state for malformed packets
+                        debug!("PTCP non-fatal read error: {}, continuing", e);
+                        continue;
+                    }
+                };
+
                 let seq = packet.sent;
                 let packet = session.lock().unwrap().recv(packet);
                 {
@@ -424,7 +499,14 @@ pub async fn dh_reader(
                             }
                             log_fd_state("dh_reader conn ready", &channels, &conn_channels);
                         } else if status == "DISC" || status.starts_with("DISC") {
-                            let removed = channels.lock().unwrap().remove(&realm);
+                            // Close channel before removing to prevent race condition
+                            let removed = {
+                                let mut chans = channels.lock().unwrap();
+                                if let Some(channel) = chans.get(&realm) {
+                                    channel.close();
+                                }
+                                chans.remove(&realm)
+                            };
                             if removed.is_some() {
                                 warn!(
                                     "Realm {:08x} device sent DISC; removing client channel",
@@ -661,5 +743,111 @@ mod tests {
         let second = channel.recv(&mut shutdown_rx).await.unwrap();
         assert_eq!(second, b"b");
         let _ = shutdown_tx.send(ShutdownReason::Restart);
+    }
+
+    #[tokio::test]
+    async fn channel_close_prevents_push() {
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        // Push initial data
+        channel
+            .push(b"a".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
+            .await;
+        
+        // Close the channel
+        channel.close();
+        assert!(channel.is_closed());
+
+        // Push after close should be silently ignored
+        channel
+            .push(b"b".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
+            .await;
+
+        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        // Should only receive the first message
+        let first = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(first, b"a");
+        // Channel is closed and buffer is empty, recv should return None
+        assert!(channel.recv(&mut shutdown_rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_close_unblocks_blocked_push() {
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        // Fill the buffer to capacity=1
+        channel
+            .push(b"a".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let channel_block = channel.clone();
+        let health_block = health.clone();
+        tokio::spawn(async move {
+            channel_block
+                .push(b"b".to_vec(), 1, DropPolicy::Block, 1, &*health_block)
+                .await;
+            let _ = done_tx.send(());
+        });
+
+        // Wait a bit for the push to block
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Verify push is blocked
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut done_rx)
+                .await
+                .is_err()
+        );
+
+        // Close the channel - should unblock the push
+        channel.close();
+
+        // Now the push should complete (aborted due to closed channel)
+        tokio::time::timeout(Duration::from_millis(200), &mut done_rx)
+            .await
+            .expect("push should complete after close")
+            .expect("push task join failed");
+    }
+
+    #[tokio::test]
+    async fn channel_close_recv_returns_none_when_empty() {
+        let channel = ClientChannel::new();
+        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+
+        // Close the channel immediately (no data pushed)
+        channel.close();
+
+        // recv should return None immediately since buffer is empty and closed
+        let result = channel.recv(&mut shutdown_rx).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_close_drains_existing_data() {
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+
+        // Push some data
+        channel
+            .push(b"a".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
+            .await;
+        channel
+            .push(b"b".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
+            .await;
+
+        // Close the channel
+        channel.close();
+
+        // Should still be able to drain existing data
+        let first = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(first, b"a");
+        let second = channel.recv(&mut shutdown_rx).await.unwrap();
+        assert_eq!(second, b"b");
+        // Now buffer is empty and closed, should return None
+        assert!(channel.recv(&mut shutdown_rx).await.is_none());
     }
 }

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use log::{debug, trace};
 use std::cmp;
 use std::io;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 
 pub enum PTCPEvent {
@@ -254,9 +255,11 @@ impl PTCPSession {
     pub fn send(&mut self, body: PTCPBody) -> PTCPPacket {
         let sent = self.sent;
         let recv = self.recv;
+        // pid counts down from 0xFFFF, wrapping around every 65536 messages
+        // Use modular arithmetic to prevent underflow when count > 0xFFFF
         let pid = match body {
             PTCPBody::Sync => 0x0002FFFF,
-            _ => 0x0000FFFF - self.count,
+            _ => 0x0000FFFF - (self.count & 0xFFFF),
         };
         let lmid = self.id;
         let rmid = self.rmid;
@@ -288,10 +291,65 @@ impl PTCPSession {
     }
 }
 
+/// Error type for PTCP read operations
+#[derive(Debug)]
+pub enum PTCPReadError {
+    /// IO error from the underlying socket
+    Io(io::Error),
+    /// Received a malformed packet (undersized, invalid magic, etc.)
+    /// Contains the error description
+    Malformed(String),
+}
+
+impl std::fmt::Display for PTCPReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PTCPReadError::Io(e) => write!(f, "IO error: {}", e),
+            PTCPReadError::Malformed(msg) => write!(f, "Malformed packet: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for PTCPReadError {}
+
+impl From<io::Error> for PTCPReadError {
+    fn from(e: io::Error) -> Self {
+        PTCPReadError::Io(e)
+    }
+}
+
+impl From<PTCPReadError> for io::Error {
+    fn from(e: PTCPReadError) -> Self {
+        match e {
+            PTCPReadError::Io(io_err) => io_err,
+            PTCPReadError::Malformed(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+        }
+    }
+}
+
+impl PTCPReadError {
+    /// Returns true if this error is fatal and should trigger a restart
+    pub fn is_fatal(&self) -> bool {
+        match self {
+            PTCPReadError::Io(e) => {
+                // These errors indicate the connection is dead or unusable
+                e.kind() == io::ErrorKind::ConnectionRefused
+                    || e.kind() == io::ErrorKind::ConnectionReset
+                    || e.kind() == io::ErrorKind::NotConnected
+                    || e.kind() == io::ErrorKind::TimedOut
+            }
+            // Malformed packets are not fatal - could be transient network corruption
+            PTCPReadError::Malformed(_) => false,
+        }
+    }
+}
+
 #[async_trait]
 pub trait PTCP {
     async fn ptcp_request(&self, packet: PTCPPacket) -> io::Result<()>;
-    async fn ptcp_read(&self) -> PTCPPacket;
+    /// Read a PTCP packet from the socket.
+    /// Returns Ok(packet) on success, Err on IO error or malformed packet.
+    async fn ptcp_read(&self) -> Result<PTCPPacket, PTCPReadError>;
 }
 
 #[async_trait]
@@ -309,48 +367,45 @@ impl PTCP for UdpSocket {
         })
     }
 
-    async fn ptcp_read(&self) -> PTCPPacket {
+    async fn ptcp_read(&self) -> Result<PTCPPacket, PTCPReadError> {
         trace!("### {}", self.peer_addr().unwrap());
 
         // Larger buffer for video frames
         let mut buf = [0u8; 65535];
-        let n = match self.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
+
+        // Timeout on recv to prevent indefinite blocking if network path is black-holed
+        const RECV_TIMEOUT_SECS: u64 = 30;
+        let recv_result = tokio::time::timeout(
+            Duration::from_secs(RECV_TIMEOUT_SECS),
+            self.recv(&mut buf),
+        )
+        .await;
+
+        let n = match recv_result {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
                 log::error!("PTCP recv error: {}", e);
-                return PTCPPacket {
-                    sent: 0,
-                    recv: 0,
-                    pid: 0,
-                    lmid: 0,
-                    rmid: 0,
-                    body: PTCPBody::Empty,
-                };
+                return Err(PTCPReadError::Io(e));
+            }
+            Err(_) => {
+                log::warn!("PTCP recv timeout after {}s", RECV_TIMEOUT_SECS);
+                return Err(PTCPReadError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("UDP recv timeout after {}s", RECV_TIMEOUT_SECS),
+                )));
             }
         };
 
         if n < 24 {
-            log::warn!("PTCP: received undersized packet ({} bytes)", n);
-            return PTCPPacket {
-                sent: 0,
-                recv: 0,
-                pid: 0,
-                lmid: 0,
-                rmid: 0,
-                body: PTCPBody::Empty,
-            };
+            let msg = format!("undersized packet ({} bytes)", n);
+            log::warn!("PTCP: {}", msg);
+            return Err(PTCPReadError::Malformed(msg));
         }
 
         if &buf[0..4] != b"PTCP" {
-            log::warn!("PTCP: invalid magic in packet");
-            return PTCPPacket {
-                sent: 0,
-                recv: 0,
-                pid: 0,
-                lmid: 0,
-                rmid: 0,
-                body: PTCPBody::Empty,
-            };
+            let msg = "invalid magic in packet".to_string();
+            log::warn!("PTCP: {}", msg);
+            return Err(PTCPReadError::Malformed(msg));
         }
 
         let packet = PTCPPacket::parse(&buf[0..n]);
@@ -359,7 +414,107 @@ impl PTCP for UdpSocket {
         packet.try_print_data();
         trace!("---");
 
-        packet
+        Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pid_calculation_normal() {
+        let mut session = PTCPSession::new();
+
+        // First message: count=0, pid = 0xFFFF - 0 = 65535
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0x0000FFFF);
+
+        // Second message: count=1, pid = 0xFFFF - 1 = 65534
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0x0000FFFE);
+    }
+
+    #[test]
+    fn test_pid_calculation_at_boundary() {
+        let mut session = PTCPSession::new();
+        // Manually set count to 65534 (just before wrap boundary)
+        session.count = 65534;
+
+        // count=65534, pid = 0xFFFF - 65534 = 1
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 1);
+
+        // count=65535, pid = 0xFFFF - 65535 = 0
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0);
+
+        // count=65536, pid = 0xFFFF - (65536 & 0xFFFF) = 0xFFFF - 0 = 65535
+        // This would have been 0xFFFFFFFF without the fix!
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0x0000FFFF);
+
+        // count=65537, pid = 0xFFFF - (65537 & 0xFFFF) = 0xFFFF - 1 = 65534
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0x0000FFFE);
+    }
+
+    #[test]
+    fn test_pid_calculation_large_count() {
+        let mut session = PTCPSession::new();
+        // Set count to a very large value (multiple wraparounds)
+        session.count = 200000; // = 3 * 65536 + 3392
+
+        // pid = 0xFFFF - (200000 & 0xFFFF) = 0xFFFF - 3392 = 62143
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.pid, 0x0000FFFF - 3392);
+        assert!(packet.pid <= 0xFFFF, "pid should be in 16-bit range");
+    }
+
+    #[test]
+    fn test_pid_sync_special_case() {
+        let mut session = PTCPSession::new();
+
+        // Sync packets have a special pid value
+        let packet = session.send(PTCPBody::Sync);
+        assert_eq!(packet.pid, 0x0002FFFF);
+
+        // Sync doesn't increment count
+        assert_eq!(session.count, 0);
+    }
+
+    #[test]
+    fn test_pid_empty_doesnt_increment_count() {
+        let mut session = PTCPSession::new();
+
+        // Send a regular message first
+        session.send(PTCPBody::Heartbeat);
+        assert_eq!(session.count, 1);
+
+        // Empty packets don't increment count
+        session.send(PTCPBody::Empty);
+        assert_eq!(session.count, 1);
+
+        session.send(PTCPBody::Empty);
+        assert_eq!(session.count, 1);
+
+        // But regular messages do
+        session.send(PTCPBody::Heartbeat);
+        assert_eq!(session.count, 2);
+    }
+
+    #[test]
+    fn test_session_sent_recv_tracking() {
+        let mut session = PTCPSession::new();
+
+        // Heartbeat body is 12 bytes
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.sent, 0); // First packet starts at 0
+        assert_eq!(session.sent, 12); // After sending, sent = 12
+
+        let packet = session.send(PTCPBody::Heartbeat);
+        assert_eq!(packet.sent, 12); // Second packet starts at 12
+        assert_eq!(session.sent, 24); // After sending, sent = 24
     }
 }
 

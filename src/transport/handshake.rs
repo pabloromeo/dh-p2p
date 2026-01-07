@@ -184,7 +184,7 @@ pub async fn p2p_handshake(
         .ptcp_request(session.send(PTCPBody::Sync))
         .await
         .expect("PTCP send failed during relay sync");
-    session.recv(socket2.ptcp_read().await);
+    session.recv(socket2.ptcp_read().await?);
 
     if relay_mode {
         info!("Relay mode enabled");
@@ -197,10 +197,10 @@ pub async fn p2p_handshake(
         )))
         .await
         .expect("PTCP send failed during relay command");
-    let mut res = session.recv(socket2.ptcp_read().await);
+    let mut res = session.recv(socket2.ptcp_read().await?);
 
     while let PTCPBody::Empty = res.body {
-        res = session.recv(socket2.ptcp_read().await);
+        res = session.recv(socket2.ptcp_read().await?);
     }
 
     let sign = match res.body {
@@ -310,7 +310,7 @@ pub async fn p2p_handshake(
         .ptcp_request(session.send(PTCPBody::Sync))
         .await
         .expect("PTCP send failed during direct sync");
-    let mut res = session.recv(socket.ptcp_read().await);
+    let mut res = session.recv(socket.ptcp_read().await?);
     assert!(matches!(res.body, PTCPBody::Sync), "Invalid response");
 
     socket
@@ -326,9 +326,9 @@ pub async fn p2p_handshake(
         .await
         .expect("PTCP send failed during sign command");
 
-    res = session.recv(socket.ptcp_read().await);
+    res = session.recv(socket.ptcp_read().await?);
     while let PTCPBody::Empty = res.body {
-        res = session.recv(socket.ptcp_read().await);
+        res = session.recv(socket.ptcp_read().await?);
     }
     match res.body {
         PTCPBody::Command(ref c) => {
@@ -343,7 +343,7 @@ pub async fn p2p_handshake(
         )))
         .await
         .expect("PTCP send failed during final command");
-    res = session.recv(socket.ptcp_read().await);
+    res = session.recv(socket.ptcp_read().await?);
 
     assert!(matches!(res.body, PTCPBody::Empty), "Invalid response");
 
