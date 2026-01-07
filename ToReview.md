@@ -207,7 +207,7 @@ All tests pass.
 
 ## 🟠 High-Risk Issue 4: No Timeout on UDP recv
 
-**Status**: ✅ FIXED
+**Status**: ✅ FIXED (Updated 2026-01-07)
 
 **Location**: `src/transport/ptcp.rs`
 
@@ -215,10 +215,10 @@ All tests pass.
 The `recv` call blocked indefinitely. If the network path became black-holed, this would block forever.
 
 **Fix Applied**:
-Added 30-second timeout to UDP recv:
+Added 60-second timeout to UDP recv as a backstop (not fatal):
 
 ```rust
-const RECV_TIMEOUT_SECS: u64 = 30;
+const RECV_TIMEOUT_SECS: u64 = 60;
 let recv_result = tokio::time::timeout(
     Duration::from_secs(RECV_TIMEOUT_SECS),
     self.recv(&mut buf),
@@ -228,7 +228,8 @@ let n = match recv_result {
     Ok(Ok(n)) => n,
     Ok(Err(e)) => return Err(PTCPReadError::Io(e)),
     Err(_) => {
-        log::warn!("PTCP recv timeout after {}s", RECV_TIMEOUT_SECS);
+        // Not fatal - device may just have nothing to send
+        log::debug!("PTCP recv timeout after {}s, retrying", RECV_TIMEOUT_SECS);
         return Err(PTCPReadError::Io(io::Error::new(
             io::ErrorKind::TimedOut,
             format!("UDP recv timeout after {}s", RECV_TIMEOUT_SECS),
@@ -237,7 +238,9 @@ let n = match recv_result {
 };
 ```
 
-Also updated `is_fatal()` to treat `TimedOut` as fatal, triggering automatic restart.
+**Important**: `TimedOut` is **NOT** classified as fatal in `is_fatal()`. A timeout just means no data arrived - the device may be legitimately idle (between keyframes, no motion, etc.). The existing **watchdog** handles genuine connection death by monitoring `last_activity` and triggering restart if no packets for ~6 seconds.
+
+This prevents spurious restarts when streams have long pauses in data.
 
 ---
 
@@ -538,5 +541,6 @@ This will force wraparound to occur within minutes instead of hours, confirming 
 | 2026-01-06 | Issue #6: Channel cleanup race | ✅ FIXED | Added `closed` flag to ClientChannel, prevents push after close, unblocks blocked pushers |
 | 2026-01-06 | Issue #7: Retransmission | ⏭️ SKIPPED | Not needed - existing watchdog handles connection failures |
 | 2026-01-06 | Channel tests | Added | 4 tests for close behavior, total 29 tests all passing |
+| 2026-01-07 | Issue #4: UDP timeout behavior | 🔄 REFINED | TimedOut is NO LONGER fatal - prevents spurious restarts during idle periods. Timeout increased to 60s. Watchdog handles connection death. |
 
 

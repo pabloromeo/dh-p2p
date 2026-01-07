@@ -333,10 +333,11 @@ impl PTCPReadError {
         match self {
             PTCPReadError::Io(e) => {
                 // These errors indicate the connection is dead or unusable
+                // Note: TimedOut is NOT fatal - it just means no data arrived in the timeout
+                // period. The watchdog will handle genuine connection death.
                 e.kind() == io::ErrorKind::ConnectionRefused
                     || e.kind() == io::ErrorKind::ConnectionReset
                     || e.kind() == io::ErrorKind::NotConnected
-                    || e.kind() == io::ErrorKind::TimedOut
             }
             // Malformed packets are not fatal - could be transient network corruption
             PTCPReadError::Malformed(_) => false,
@@ -373,8 +374,9 @@ impl PTCP for UdpSocket {
         // Larger buffer for video frames
         let mut buf = [0u8; 65535];
 
-        // Timeout on recv to prevent indefinite blocking if network path is black-holed
-        const RECV_TIMEOUT_SECS: u64 = 30;
+        // Timeout on recv to prevent indefinite blocking if kernel/network stack is stuck
+        // This is just a backstop - the watchdog handles genuine connection death
+        const RECV_TIMEOUT_SECS: u64 = 60;
         let recv_result = tokio::time::timeout(
             Duration::from_secs(RECV_TIMEOUT_SECS),
             self.recv(&mut buf),
@@ -388,7 +390,9 @@ impl PTCP for UdpSocket {
                 return Err(PTCPReadError::Io(e));
             }
             Err(_) => {
-                log::warn!("PTCP recv timeout after {}s", RECV_TIMEOUT_SECS);
+                // This is not fatal - device may just have nothing to send
+                // The watchdog will handle genuine connection death
+                log::debug!("PTCP recv timeout after {}s, retrying", RECV_TIMEOUT_SECS);
                 return Err(PTCPReadError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!("UDP recv timeout after {}s", RECV_TIMEOUT_SECS),
