@@ -20,6 +20,9 @@ use crate::fdlog::log_fd_snapshot;
 use crate::shutdown::ShutdownReason;
 use crate::transport::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP};
 
+type RealmForwarders = Arc<Mutex<HashMap<u32, RealmForwarder>>>;
+static NEXT_REALM_FORWARDER_ID: AtomicU64 = AtomicU64::new(1);
+
 fn log_fd_state(
     label: &str,
     channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
@@ -163,6 +166,158 @@ impl ClientChannel {
             }
         }
     }
+}
+
+#[derive(Clone)]
+struct RealmForwarder {
+    id: u64,
+    target_channel: ClientChannel,
+    queue: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
+    not_empty: Arc<tokio::sync::Notify>,
+    closed: Arc<AtomicBool>,
+}
+
+impl RealmForwarder {
+    fn new(id: u64, target_channel: ClientChannel) -> Self {
+        Self {
+            id,
+            target_channel,
+            queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            not_empty: Arc::new(tokio::sync::Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.not_empty.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    async fn enqueue(
+        &self,
+        data: Vec<u8>,
+        queue_capacity: usize,
+        drop_policy: DropPolicy,
+        realm: u32,
+        health: &HealthCounters,
+    ) {
+        if self.is_closed() {
+            return;
+        }
+
+        let mut queue = self.queue.lock().await;
+        if queue.len() < queue_capacity {
+            queue.push_back(data);
+            self.not_empty.notify_one();
+            return;
+        }
+
+        match drop_policy {
+            DropPolicy::Block => {
+                // Preserve reader isolation: we cannot block globally here.
+                warn!(
+                    "Realm {:08x}: forwarder queue full (Block), dropping newest frame to keep other realms flowing",
+                    realm
+                );
+                health.drops_newest.fetch_add(1, Ordering::Relaxed);
+            }
+            DropPolicy::DropNewest => {
+                warn!(
+                    "Realm {:08x}: forwarder queue full (DropNewest), dropping newest frame",
+                    realm
+                );
+                health.drops_newest.fetch_add(1, Ordering::Relaxed);
+            }
+            DropPolicy::DropOldestKeepLatest => {
+                if queue.pop_front().is_some() {
+                    warn!(
+                        "Realm {:08x}: forwarder queue full (DropOldestKeepLatest), dropping oldest frame to keep latest",
+                        realm
+                    );
+                    health.drops_oldest.fetch_add(1, Ordering::Relaxed);
+                }
+                queue.push_back(data);
+                self.not_empty.notify_one();
+            }
+        }
+    }
+}
+
+fn spawn_forwarder_worker(
+    realm: u32,
+    forwarder: RealmForwarder,
+    channel_capacity: usize,
+    drop_policy: DropPolicy,
+    health: Arc<HealthCounters>,
+    realm_forwarders: RealmForwarders,
+) {
+    tokio::spawn(async move {
+        loop {
+            let next_data = {
+                let mut queue = forwarder.queue.lock().await;
+                queue.pop_front()
+            };
+
+            if let Some(data) = next_data {
+                forwarder
+                    .target_channel
+                    .push(
+                        data,
+                        channel_capacity,
+                        drop_policy.clone(),
+                        realm,
+                        &health,
+                    )
+                    .await;
+                continue;
+            }
+
+            if forwarder.is_closed() || forwarder.target_channel.is_closed() {
+                break;
+            }
+
+            // Poll with timeout so closed target channels are cleaned promptly.
+            let _ =
+                tokio::time::timeout(Duration::from_millis(100), forwarder.not_empty.notified())
+                    .await;
+        }
+
+        forwarder.close();
+
+        let mut map = realm_forwarders.lock().unwrap();
+        if map.get(&realm).map(|f| f.id) == Some(forwarder.id) {
+            map.remove(&realm);
+        }
+    });
+}
+
+fn create_realm_forwarder(
+    realm: u32,
+    channel: ClientChannel,
+    channel_capacity: usize,
+    drop_policy: DropPolicy,
+    health: Arc<HealthCounters>,
+    realm_forwarders: RealmForwarders,
+) -> RealmForwarder {
+    let id = NEXT_REALM_FORWARDER_ID.fetch_add(1, Ordering::Relaxed);
+    let forwarder = RealmForwarder::new(id, channel);
+    {
+        let mut map = realm_forwarders.lock().unwrap();
+        map.insert(realm, forwarder.clone());
+    }
+    spawn_forwarder_worker(
+        realm,
+        forwarder.clone(),
+        channel_capacity,
+        drop_policy,
+        health,
+        realm_forwarders,
+    );
+    forwarder
 }
 
 /**
@@ -364,19 +519,57 @@ pub async fn dh_writer(
 async fn send_to_clients(
     packets: Vec<(u32, Vec<u8>)>,
     channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    realm_forwarders: &RealmForwarders,
     drop_policy: DropPolicy,
     capacity: usize,
     health: &Arc<HealthCounters>,
 ) {
     for (realm, data) in packets {
-        let tx = {
+        let channel = {
             let chans = channels.lock().unwrap();
             chans.get(&realm).cloned()
         };
-        if let Some(tx) = tx {
-            tx.push(data, capacity, drop_policy.clone(), realm, health)
-                .await;
-        }
+
+        let Some(channel) = channel else {
+            let mut forwarders = realm_forwarders.lock().unwrap();
+            if let Some(stale) = forwarders.remove(&realm) {
+                stale.close();
+            }
+            continue;
+        };
+
+        let existing_forwarder = {
+            let forwarders = realm_forwarders.lock().unwrap();
+            forwarders.get(&realm).cloned()
+        };
+
+        let forwarder = match existing_forwarder {
+            Some(f) if !f.is_closed() && !f.target_channel.is_closed() => f,
+            Some(stale) => {
+                stale.close();
+                create_realm_forwarder(
+                    realm,
+                    channel.clone(),
+                    capacity,
+                    drop_policy.clone(),
+                    health.clone(),
+                    realm_forwarders.clone(),
+                )
+            }
+            None => create_realm_forwarder(
+                realm,
+                channel.clone(),
+                capacity,
+                drop_policy.clone(),
+                health.clone(),
+                realm_forwarders.clone(),
+            ),
+        };
+
+        let queue_capacity = capacity.max(1);
+        forwarder
+            .enqueue(data, queue_capacity, drop_policy.clone(), realm, health)
+            .await;
     }
 }
 
@@ -429,6 +622,8 @@ pub async fn dh_reader(
     health: Arc<HealthCounters>,
     heartbeat_ok: Option<Arc<AtomicBool>>,
 ) {
+    let realm_forwarders: RealmForwarders = Arc::new(Mutex::new(HashMap::new()));
+
     // Create jitter buffer if enabled
     let mut jitter_buffer = if buffer_ms > 0 {
         let jb = JitterBuffer::new(Duration::from_millis(buffer_ms));
@@ -558,6 +753,7 @@ pub async fn dh_reader(
                                 send_to_clients(
                                     ready,
                                     &channels,
+                                    &realm_forwarders,
                                     drop_policy.clone(),
                                     channel_capacity,
                                     &health,
@@ -570,6 +766,7 @@ pub async fn dh_reader(
                             send_to_clients(
                                 packets,
                                 &channels,
+                                &realm_forwarders,
                                 drop_policy.clone(),
                                 channel_capacity,
                                 &health,
@@ -597,6 +794,7 @@ pub async fn dh_reader(
                         send_to_clients(
                             ready,
                             &channels,
+                            &realm_forwarders,
                             drop_policy.clone(),
                             channel_capacity,
                             &health,
@@ -621,6 +819,7 @@ pub async fn dh_reader(
                     send_to_clients(
                         remaining,
                         &channels,
+                        &realm_forwarders,
                         drop_policy.clone(),
                         channel_capacity,
                         &health,
@@ -637,11 +836,23 @@ pub async fn dh_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
     use tokio::sync::watch;
+
+    async fn connected_udp_pair() -> (Arc<UdpSocket>, Arc<UdpSocket>) {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+        a.connect(b_addr).await.unwrap();
+        b.connect(a_addr).await.unwrap();
+        (Arc::new(a), Arc::new(b))
+    }
 
     #[tokio::test]
     async fn drop_policy_drop_newest_drops_when_full() {
         let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
         let channel = ClientChannel::new();
         channels.lock().unwrap().insert(1, channel.clone());
         let health = Arc::new(HealthCounters::default());
@@ -650,6 +861,7 @@ mod tests {
         send_to_clients(
             vec![(1, b"a".to_vec())],
             &channels,
+            &realm_forwarders,
             DropPolicy::DropNewest,
             1,
             &health,
@@ -659,6 +871,7 @@ mod tests {
         send_to_clients(
             vec![(1, b"b".to_vec())],
             &channels,
+            &realm_forwarders,
             DropPolicy::DropNewest,
             1,
             &health,
@@ -764,7 +977,7 @@ mod tests {
             .push(b"b".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
             .await;
 
-        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
         // Should only receive the first message
         let first = channel.recv(&mut shutdown_rx).await.unwrap();
         assert_eq!(first, b"a");
@@ -815,7 +1028,8 @@ mod tests {
     #[tokio::test]
     async fn channel_close_recv_returns_none_when_empty() {
         let channel = ClientChannel::new();
-        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
 
         // Close the channel immediately (no data pushed)
         channel.close();
@@ -829,7 +1043,8 @@ mod tests {
     async fn channel_close_drains_existing_data() {
         let channel = ClientChannel::new();
         let health = Arc::new(HealthCounters::default());
-        let (_, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
 
         // Push some data
         channel
@@ -849,5 +1064,449 @@ mod tests {
         assert_eq!(second, b"b");
         // Now buffer is empty and closed, should return None
         assert!(channel.recv(&mut shutdown_rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_to_clients_does_not_block_other_realms_when_one_realm_is_full() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let slow_realm_channel = ClientChannel::new();
+        let fast_realm_channel = ClientChannel::new();
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let health = Arc::new(HealthCounters::default());
+
+        channels.lock().unwrap().insert(1, slow_realm_channel.clone());
+        channels.lock().unwrap().insert(2, fast_realm_channel.clone());
+
+        // Fill slow realm queue so next push blocks under DropPolicy::Block.
+        slow_realm_channel
+            .push(b"slow-initial".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        let channels_clone = channels.clone();
+        let health_clone = health.clone();
+        let send_task = tokio::spawn(async move {
+            send_to_clients(
+                vec![(1, b"slow-blocked".to_vec()), (2, b"fast".to_vec())],
+                &channels_clone,
+                &realm_forwarders,
+                DropPolicy::Block,
+                1,
+                &health_clone,
+            )
+            .await;
+        });
+
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let fast_recv_result =
+            tokio::time::timeout(Duration::from_millis(150), fast_realm_channel.recv(&mut shutdown_rx))
+                .await;
+
+        match fast_recv_result {
+            Ok(Some(data)) => assert_eq!(data, b"fast"),
+            Ok(None) => {
+                send_task.abort();
+                panic!("fast realm channel closed unexpectedly");
+            }
+            Err(_) => {
+                send_task.abort();
+                panic!("fast realm should not be blocked by unrelated slow realm");
+            }
+        }
+
+        // Ensure task does not keep running in background in case of regressions.
+        let _ = send_task.await;
+    }
+
+    #[tokio::test]
+    async fn send_to_clients_recreates_forwarder_when_realm_channel_is_reused() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let old_channel = ClientChannel::new();
+        let new_channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        channels.lock().unwrap().insert(1, old_channel.clone());
+        send_to_clients(
+            vec![(1, b"old".to_vec())],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::DropNewest,
+            1,
+            &health,
+        )
+        .await;
+
+        old_channel.close();
+        channels.lock().unwrap().insert(1, new_channel.clone());
+
+        send_to_clients(
+            vec![(1, b"new".to_vec())],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::DropNewest,
+            1,
+            &health,
+        )
+        .await;
+
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let recv = tokio::time::timeout(Duration::from_millis(200), new_channel.recv(&mut shutdown_rx))
+            .await
+            .expect("new channel should receive forwarded payload");
+        assert_eq!(recv.expect("new channel closed unexpectedly"), b"new");
+    }
+
+    #[tokio::test]
+    async fn forwarder_is_cleaned_up_after_target_channel_closes() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        channels.lock().unwrap().insert(1, channel.clone());
+        send_to_clients(
+            vec![(1, b"a".to_vec())],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::DropNewest,
+            1,
+            &health,
+        )
+        .await;
+        assert_eq!(realm_forwarders.lock().unwrap().len(), 1);
+
+        channel.close();
+
+        let mut cleaned = false;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if realm_forwarders.lock().unwrap().is_empty() {
+                cleaned = true;
+                break;
+            }
+        }
+        assert!(cleaned, "forwarder should be removed after channel close");
+    }
+
+    #[tokio::test]
+    async fn forwarder_queue_is_bounded_under_block_policy() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+
+        channels.lock().unwrap().insert(1, channel.clone());
+
+        // Fill client channel so worker blocks on push under Block policy.
+        channel
+            .push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        send_to_clients(
+            vec![
+                (1, b"p1".to_vec()),
+                (1, b"p2".to_vec()),
+                (1, b"p3".to_vec()),
+                (1, b"p4".to_vec()),
+                (1, b"p5".to_vec()),
+            ],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::Block,
+            1,
+            &health,
+        )
+        .await;
+
+        assert!(
+            health.drops_newest.load(Ordering::Relaxed) > 0,
+            "bounded forwarder queue should drop when full"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_clients_preserves_per_realm_order_under_pressure() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let slow = ClientChannel::new();
+        let fast = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+        channels.lock().unwrap().insert(1, slow.clone());
+        channels.lock().unwrap().insert(2, fast.clone());
+
+        slow.push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        send_to_clients(
+            vec![
+                (1, b"s1".to_vec()),
+                (2, b"a".to_vec()),
+                (1, b"s2".to_vec()),
+                (2, b"b".to_vec()),
+                (2, b"c".to_vec()),
+            ],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::Block,
+            10,
+            &health,
+        )
+        .await;
+
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let a = tokio::time::timeout(Duration::from_millis(300), fast.recv(&mut shutdown_rx))
+            .await
+            .expect("first fast packet should arrive")
+            .expect("fast channel should stay open");
+        let b = tokio::time::timeout(Duration::from_millis(300), fast.recv(&mut shutdown_rx))
+            .await
+            .expect("second fast packet should arrive")
+            .expect("fast channel should stay open");
+        let c = tokio::time::timeout(Duration::from_millis(300), fast.recv(&mut shutdown_rx))
+            .await
+            .expect("third fast packet should arrive")
+            .expect("fast channel should stay open");
+        assert_eq!(a, b"a");
+        assert_eq!(b, b"b");
+        assert_eq!(c, b"c");
+    }
+
+    #[tokio::test]
+    async fn send_to_clients_handles_zero_capacity_without_hanging() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+        channels.lock().unwrap().insert(1, channel.clone());
+
+        send_to_clients(
+            vec![(1, b"a".to_vec()), (1, b"b".to_vec()), (1, b"c".to_vec())],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::DropNewest,
+            0,
+            &health,
+        )
+        .await;
+
+        assert!(
+            health.drops_newest.load(Ordering::Relaxed) > 0,
+            "zero channel capacity should not hang and should account dropped packets"
+        );
+        assert!(channel.buffer.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forwarder_cleans_up_with_pending_queue_after_channel_close() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let channel = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+        channels.lock().unwrap().insert(1, channel.clone());
+
+        channel
+            .push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+        send_to_clients(
+            vec![(1, b"q1".to_vec()), (1, b"q2".to_vec()), (1, b"q3".to_vec())],
+            &channels,
+            &realm_forwarders,
+            DropPolicy::Block,
+            3,
+            &health,
+        )
+        .await;
+
+        channel.close();
+        let mut removed = false;
+        for _ in 0..15 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if realm_forwarders.lock().unwrap().is_empty() {
+                removed = true;
+                break;
+            }
+        }
+        assert!(removed, "forwarder should be removed after close with backlog");
+    }
+
+    #[tokio::test]
+    async fn send_to_clients_survives_disconnect_reconnect_burst() {
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
+        let old = ClientChannel::new();
+        let new = ClientChannel::new();
+        let health = Arc::new(HealthCounters::default());
+        channels.lock().unwrap().insert(1, old.clone());
+
+        let channels_sender = channels.clone();
+        let forwarders_sender = realm_forwarders.clone();
+        let health_sender = health.clone();
+        let (halfway_tx, halfway_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        let sender = tokio::spawn(async move {
+            for i in 0..25u8 {
+                send_to_clients(
+                    vec![(1, vec![i])],
+                    &channels_sender,
+                    &forwarders_sender,
+                    DropPolicy::DropNewest,
+                    8,
+                    &health_sender,
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+            let _ = halfway_tx.send(());
+            let _ = resume_rx.await;
+            for i in 25..50u8 {
+                send_to_clients(
+                    vec![(1, vec![i])],
+                    &channels_sender,
+                    &forwarders_sender,
+                    DropPolicy::DropNewest,
+                    8,
+                    &health_sender,
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let _ = tokio::time::timeout(Duration::from_millis(300), halfway_rx)
+            .await
+            .expect("first half should complete before reconnect");
+        old.close();
+        channels.lock().unwrap().insert(1, new.clone());
+        let _ = resume_tx.send(());
+
+        sender.await.expect("sender task should complete");
+
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let got = tokio::time::timeout(Duration::from_millis(300), new.recv(&mut shutdown_rx)).await;
+        assert!(got.is_ok(), "new channel should receive packets after reconnect");
+    }
+
+    #[tokio::test]
+    async fn dh_reader_direct_path_isolates_slow_and_fast_realms() {
+        let (reader_socket, device_socket) = connected_udp_pair().await;
+        let session = Arc::new(Mutex::new(PTCPSession::new()));
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::new()));
+        let slow = ClientChannel::new();
+        let fast = ClientChannel::new();
+        channels.lock().unwrap().insert(1, slow.clone());
+        channels.lock().unwrap().insert(2, fast.clone());
+        let health = Arc::new(HealthCounters::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownReason::Stop);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+
+        slow.push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        let reader_handle = tokio::spawn(dh_reader(
+            session.clone(),
+            reader_socket.clone(),
+            channels.clone(),
+            conn_channels.clone(),
+            shutdown_rx,
+            shutdown_tx.clone(),
+            last_activity,
+            DropPolicy::Block,
+            0,
+            1,
+            health.clone(),
+            None,
+        ));
+
+        let mut device_session = PTCPSession::new();
+        device_socket
+            .ptcp_request(device_session.send(PTCPBody::Payload(PTCPPayload {
+                realm: 1,
+                data: b"slow".to_vec(),
+            })))
+            .await
+            .unwrap();
+        device_socket
+            .ptcp_request(device_session.send(PTCPBody::Payload(PTCPPayload {
+                realm: 2,
+                data: b"fast".to_vec(),
+            })))
+            .await
+            .unwrap();
+
+        let (_s_tx, mut s_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let fast_data = tokio::time::timeout(Duration::from_millis(500), fast.recv(&mut s_rx))
+            .await
+            .expect("fast realm should receive data")
+            .expect("fast channel closed unexpectedly");
+        assert_eq!(fast_data, b"fast");
+
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
+        reader_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dh_reader_jitter_path_isolates_slow_and_fast_realms() {
+        let (reader_socket, device_socket) = connected_udp_pair().await;
+        let session = Arc::new(Mutex::new(PTCPSession::new()));
+        let channels = Arc::new(Mutex::new(HashMap::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::new()));
+        let slow = ClientChannel::new();
+        let fast = ClientChannel::new();
+        channels.lock().unwrap().insert(1, slow.clone());
+        channels.lock().unwrap().insert(2, fast.clone());
+        let health = Arc::new(HealthCounters::default());
+        let (shutdown_tx, shutdown_rx) = watch::channel(ShutdownReason::Stop);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+
+        slow.push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
+            .await;
+
+        let reader_handle = tokio::spawn(dh_reader(
+            session.clone(),
+            reader_socket.clone(),
+            channels.clone(),
+            conn_channels.clone(),
+            shutdown_rx,
+            shutdown_tx.clone(),
+            last_activity,
+            DropPolicy::Block,
+            5,
+            1,
+            health.clone(),
+            None,
+        ));
+
+        let mut device_session = PTCPSession::new();
+        device_socket
+            .ptcp_request(device_session.send(PTCPBody::Payload(PTCPPayload {
+                realm: 1,
+                data: b"slow-j".to_vec(),
+            })))
+            .await
+            .unwrap();
+        device_socket
+            .ptcp_request(device_session.send(PTCPBody::Payload(PTCPPayload {
+                realm: 2,
+                data: b"fast-j".to_vec(),
+            })))
+            .await
+            .unwrap();
+
+        let (_s_tx, mut s_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let fast_data = tokio::time::timeout(Duration::from_millis(800), fast.recv(&mut s_rx))
+            .await
+            .expect("fast realm should receive jitter-released data")
+            .expect("fast channel closed unexpectedly");
+        assert_eq!(fast_data, b"fast-j");
+
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
+        reader_handle.await.unwrap();
     }
 }
