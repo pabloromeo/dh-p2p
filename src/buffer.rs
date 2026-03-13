@@ -515,13 +515,13 @@ mod tests {
 
         // Start with base near u32::MAX
         let base = u32::MAX - 5;
-        let _ = jb.insert(base, 1, vec![1]);           // normalized = 0
-        let _ = jb.insert(base + 3, 1, vec![2]);       // normalized = 3
-        let _ = jb.insert(u32::MAX, 1, vec![3]);       // normalized = 5
+        let _ = jb.insert(base, 1, vec![1]); // normalized = 0
+        let _ = jb.insert(base + 3, 1, vec![2]); // normalized = 3
+        let _ = jb.insert(u32::MAX, 1, vec![3]); // normalized = 5
 
         // Now add packets after wraparound
-        let _ = jb.insert(0, 1, vec![4]);              // normalized = 6 (wrapping_sub)
-        let _ = jb.insert(5, 1, vec![5]);              // normalized = 11
+        let _ = jb.insert(0, 1, vec![4]); // normalized = 6 (wrapping_sub)
+        let _ = jb.insert(5, 1, vec![5]); // normalized = 11
 
         // Verify order is correct: base, base+3, MAX, 0, 5
         let all = jb.flush_all();
@@ -539,11 +539,11 @@ mod tests {
         let mut jb = JitterBuffer::new(Duration::from_millis(100));
 
         // Packets arrive in this order: 0, MAX-1, MAX, 2, 1
-        let _ = jb.insert(0, 1, vec![4]);              // First packet, becomes base
-        let _ = jb.insert(u32::MAX - 1, 1, vec![2]);   // Before base in sequence space!
-        let _ = jb.insert(u32::MAX, 1, vec![3]);       // Also before base
-        let _ = jb.insert(2, 1, vec![6]);              // After base
-        let _ = jb.insert(1, 1, vec![5]);              // After base, out of order
+        let _ = jb.insert(0, 1, vec![4]); // First packet, becomes base
+        let _ = jb.insert(u32::MAX - 1, 1, vec![2]); // Before base in sequence space!
+        let _ = jb.insert(u32::MAX, 1, vec![3]); // Also before base
+        let _ = jb.insert(2, 1, vec![6]); // After base
+        let _ = jb.insert(1, 1, vec![5]); // After base, out of order
 
         // Should be ordered: MAX-1, MAX, 0, 1, 2
         let all = jb.flush_all();

@@ -72,9 +72,9 @@ pub async fn run_loop<F, Fut>(
                 let sleep_dur =
                     Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms);
                 tokio::time::sleep(sleep_dur).await;
-                backoff_secs = (backoff_secs.saturating_mul(2)).min(config.restart_backoff_max_secs);
+                backoff_secs =
+                    (backoff_secs.saturating_mul(2)).min(config.restart_backoff_max_secs);
             }
         }
     }
 }
-

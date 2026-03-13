@@ -120,7 +120,7 @@ Near `u32` boundary, multiple packets satisfy current wrap condition while `last
 
 ---
 
-## 5) Reclassify and enrich reset-by-peer logs (medium priority)
+## 5) Reclassify and enrich reset-by-peer logs (medium priority) - COMPLETED
 
 **Problem**  
 `Connection reset by peer (os error 104)` is noisy and may be interpreted as server failure.
@@ -136,6 +136,12 @@ Near `u32` boundary, multiple packets satisfy current wrap condition while `last
 **Success criteria**
 - Logs distinguish normal client churn from real instability.
 - Easier correlation between reset bursts and upstream pressure events.
+
+**Completion notes (2026-03-13)**
+- Added reset burst tracking (`resets_last_min`) with warning escalation only when bursts exceed a configurable threshold (`--reset-burst-warn-threshold-per-minute`).
+- Reclassified TCP `ECONNRESET`/`BrokenPipe`/`ConnectionAborted` handling as expected client disconnect at info level by default, with warning-level logs only on burst escalation.
+- Enriched reset logs with actionable context (`active_realms`, `drops_newest`, `drops_oldest`, `jitter_late_drops`) and added periodic health counters for `tcp_peer_disconnects`, `tcp_peer_resets`, and `tcp_peer_reset_bursts`.
+- Added regression tests for the burst tracker window/threshold behavior and validated with full `cargo test`.
 
 ---
 
@@ -231,7 +237,7 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 - [x] 2) Make TCP accept path non-serial
 - [x] 3) Keep runtime policy optimized for live streams
 - [x] 4) Reduce jitter wraparound log noise and correct wrap accounting
-- [ ] 5) Reclassify and enrich reset-by-peer logs
+- [x] 5) Reclassify and enrich reset-by-peer logs
 - [ ] 6) Harden handshake/parser path by removing panic/unwrap/assert on network data
 - [ ] 7) Add realm ID collision protection
 - [ ] 8) Improve observability for real root-cause analysis

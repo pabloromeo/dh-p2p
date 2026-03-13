@@ -27,4 +27,3 @@ pub fn log_fd_snapshot(label: &str, channels_len: usize, conn_channels_len: usiz
         ),
     }
 }
-

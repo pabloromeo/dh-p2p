@@ -14,7 +14,7 @@ use crate::{
     config::Config,
     fdlog::log_fd_snapshot,
     metrics::MetricsHandle,
-    process::{process_reader, process_writer, ClientChannel},
+    process::{process_reader, process_writer, ClientChannel, HealthCounters, ResetBurstTracker},
     shutdown::ShutdownReason,
     transport::ptcp::PTCPEvent,
 };
@@ -24,6 +24,8 @@ pub(crate) struct AcceptDeps {
     config: Arc<Config>,
     metrics: MetricsHandle,
     dh_tx: mpsc::Sender<PTCPEvent>,
+    health: Arc<HealthCounters>,
+    reset_tracker: Arc<ResetBurstTracker>,
     channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     shutdown_rx: watch::Receiver<ShutdownReason>,
@@ -34,6 +36,8 @@ impl AcceptDeps {
         config: Arc<Config>,
         metrics: MetricsHandle,
         dh_tx: mpsc::Sender<PTCPEvent>,
+        health: Arc<HealthCounters>,
+        reset_tracker: Arc<ResetBurstTracker>,
         channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
         conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
         shutdown_rx: watch::Receiver<ShutdownReason>,
@@ -42,6 +46,8 @@ impl AcceptDeps {
             config,
             metrics,
             dh_tx,
+            health,
+            reset_tracker,
             channels,
             conn_channels,
             shutdown_rx,
@@ -74,7 +80,12 @@ impl AcceptPipeline {
     }
 }
 
-async fn handle_accepted_client(client: TcpStream, addr: SocketAddr, realm_id: u32, deps: AcceptDeps) {
+async fn handle_accepted_client(
+    client: TcpStream,
+    addr: SocketAddr,
+    realm_id: u32,
+    deps: AcceptDeps,
+) {
     let client_connected_at = Instant::now();
     info!("Accepted TCP client {}", addr);
     deps.metrics.inc_counter("client_accept");
@@ -89,7 +100,10 @@ async fn handle_accepted_client(client: TcpStream, addr: SocketAddr, realm_id: u
     );
 
     // Store the channel in the map before connect request.
-    deps.channels.lock().unwrap().insert(realm_id, channel.clone());
+    deps.channels
+        .lock()
+        .unwrap()
+        .insert(realm_id, channel.clone());
     deps.conn_channels.lock().unwrap().insert(realm_id, conn_tx);
     {
         let chans = deps.channels.lock().unwrap();
@@ -108,8 +122,11 @@ async fn handle_accepted_client(client: TcpStream, addr: SocketAddr, realm_id: u
         "Waiting for realm {:08x} to become ready (client {})",
         realm_id, addr
     );
-    let ready =
-        tokio::time::timeout(Duration::from_secs(deps.config.realm_ready_timeout_secs), conn_rx).await;
+    let ready = tokio::time::timeout(
+        Duration::from_secs(deps.config.realm_ready_timeout_secs),
+        conn_rx,
+    )
+    .await;
     match ready {
         Ok(res) => {
             if res.is_err() {
@@ -152,16 +169,43 @@ async fn handle_accepted_client(client: TcpStream, addr: SocketAddr, realm_id: u
         let shutdown_rx = deps.shutdown_rx.clone();
         let peer = addr;
         let dh_tx = deps.dh_tx.clone();
+        let channels = deps.channels.clone();
+        let health = deps.health.clone();
+        let reset_tracker = deps.reset_tracker.clone();
         async move {
-            process_reader(reader, realm_id, peer, dh_tx, shutdown_rx).await;
+            process_reader(
+                reader,
+                realm_id,
+                peer,
+                dh_tx,
+                channels,
+                health,
+                reset_tracker,
+                shutdown_rx,
+            )
+            .await;
         }
     });
 
     tokio::spawn({
         let channel = channel.clone();
+        let channels = deps.channels.clone();
+        let health = deps.health.clone();
+        let reset_tracker = deps.reset_tracker.clone();
         let shutdown_rx = deps.shutdown_rx.clone();
+        let peer = addr;
         async move {
-            process_writer(writer, channel, shutdown_rx).await;
+            process_writer(
+                writer,
+                channel,
+                realm_id,
+                peer,
+                channels,
+                health,
+                reset_tracker,
+                shutdown_rx,
+            )
+            .await;
         }
     });
 }
@@ -201,11 +245,22 @@ mod tests {
         cfg: Arc<Config>,
         metrics: MetricsHandle,
         dh_tx: mpsc::Sender<PTCPEvent>,
+        health: Arc<HealthCounters>,
+        reset_tracker: Arc<ResetBurstTracker>,
         channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
         conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
         shutdown_rx: watch::Receiver<ShutdownReason>,
     ) -> AcceptPipeline {
-        let deps = AcceptDeps::new(cfg.clone(), metrics, dh_tx, channels, conn_channels, shutdown_rx);
+        let deps = AcceptDeps::new(
+            cfg.clone(),
+            metrics,
+            dh_tx,
+            health,
+            reset_tracker,
+            channels,
+            conn_channels,
+            shutdown_rx,
+        );
         let limits = AcceptLimits::new(cfg.max_pending_realm_setups);
         AcceptPipeline::new(deps, limits)
     }
@@ -226,6 +281,8 @@ mod tests {
         cfg.max_pending_realm_setups = 8;
         let cfg = Arc::new(cfg);
         let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+        let health = Arc::new(HealthCounters::default());
+        let reset_tracker = Arc::new(ResetBurstTracker::new(Duration::from_secs(60), 20));
         let (dh_tx, mut dh_rx) = mpsc::channel::<PTCPEvent>(8);
         let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
         let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
@@ -234,6 +291,8 @@ mod tests {
             cfg.clone(),
             metrics.clone(),
             dh_tx.clone(),
+            health,
+            reset_tracker,
             channels,
             conn_channels,
             shutdown_rx,
@@ -269,6 +328,8 @@ mod tests {
         cfg.max_pending_realm_setups = 1;
         let cfg = Arc::new(cfg);
         let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+        let health = Arc::new(HealthCounters::default());
+        let reset_tracker = Arc::new(ResetBurstTracker::new(Duration::from_secs(60), 20));
         let (dh_tx, mut dh_rx) = mpsc::channel::<PTCPEvent>(8);
         let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
         let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
@@ -277,6 +338,8 @@ mod tests {
             cfg.clone(),
             metrics.clone(),
             dh_tx.clone(),
+            health,
+            reset_tracker,
             channels,
             conn_channels,
             shutdown_rx,

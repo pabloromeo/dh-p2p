@@ -377,11 +377,8 @@ impl PTCP for UdpSocket {
         // Timeout on recv to prevent indefinite blocking if kernel/network stack is stuck
         // This is just a backstop - the watchdog handles genuine connection death
         const RECV_TIMEOUT_SECS: u64 = 60;
-        let recv_result = tokio::time::timeout(
-            Duration::from_secs(RECV_TIMEOUT_SECS),
-            self.recv(&mut buf),
-        )
-        .await;
+        let recv_result =
+            tokio::time::timeout(Duration::from_secs(RECV_TIMEOUT_SECS), self.recv(&mut buf)).await;
 
         let n = match recv_result {
             Ok(Ok(n)) => n,
@@ -521,4 +518,3 @@ mod tests {
         assert_eq!(session.sent, 24); // After sending, sent = 24
     }
 }
-

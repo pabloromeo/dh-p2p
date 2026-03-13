@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,6 +22,41 @@ use crate::transport::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP
 
 type RealmForwarders = Arc<Mutex<HashMap<u32, RealmForwarder>>>;
 static NEXT_REALM_FORWARDER_ID: AtomicU64 = AtomicU64::new(1);
+
+pub struct ResetBurstTracker {
+    window: Duration,
+    warn_threshold: u64,
+    events: Mutex<VecDeque<Instant>>,
+}
+
+impl ResetBurstTracker {
+    pub fn new(window: Duration, warn_threshold: u64) -> Self {
+        Self {
+            window,
+            warn_threshold,
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn record(&self) -> (u64, bool) {
+        self.record_at(Instant::now())
+    }
+
+    fn record_at(&self, now: Instant) -> (u64, bool) {
+        let mut events = self.events.lock().unwrap();
+        while let Some(oldest) = events.front().copied() {
+            if now.saturating_duration_since(oldest) > self.window {
+                events.pop_front();
+            } else {
+                break;
+            }
+        }
+        events.push_back(now);
+        let count = events.len() as u64;
+        let should_warn = self.warn_threshold > 0 && count > self.warn_threshold;
+        (count, should_warn)
+    }
+}
 
 fn log_fd_state(
     label: &str,
@@ -84,7 +119,10 @@ impl ClientChannel {
         loop {
             // Re-check closed flag on each iteration (for Block policy waits)
             if self.is_closed() {
-                debug!("Realm {:08x}: push aborted - channel closed during wait", realm);
+                debug!(
+                    "Realm {:08x}: push aborted - channel closed during wait",
+                    realm
+                );
                 return;
             }
 
@@ -265,13 +303,7 @@ fn spawn_forwarder_worker(
             if let Some(data) = next_data {
                 forwarder
                     .target_channel
-                    .push(
-                        data,
-                        channel_capacity,
-                        drop_policy.clone(),
-                        realm,
-                        &health,
-                    )
+                    .push(data, channel_capacity, drop_policy.clone(), realm, &health)
                     .await;
                 continue;
             }
@@ -326,6 +358,11 @@ fn create_realm_forwarder(
 pub async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     channel: ClientChannel,
+    realm_id: u32,
+    peer: SocketAddr,
+    channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    health: Arc<HealthCounters>,
+    reset_tracker: Arc<ResetBurstTracker>,
     mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     loop {
@@ -334,8 +371,20 @@ pub async fn process_writer(
             None => break,
         };
 
-        if writer.write_all(&data).await.is_err() {
-            warn!("Writer: Socket closed by peer.");
+        if let Err(e) = writer.write_all(&data).await {
+            if is_peer_reset_error(&e) {
+                log_peer_reset_event(
+                    "Writer",
+                    realm_id,
+                    peer,
+                    &channels,
+                    &health,
+                    &reset_tracker,
+                    &e,
+                );
+            } else {
+                warn!("Writer error to {} (realm {:08x}): {}", peer, realm_id, e);
+            }
             break;
         }
     }
@@ -349,6 +398,9 @@ pub async fn process_reader(
     realm_id: u32,
     peer: SocketAddr,
     dh_tx: mpsc::Sender<PTCPEvent>,
+    channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    health: Arc<HealthCounters>,
+    reset_tracker: Arc<ResetBurstTracker>,
     mut shutdown: watch::Receiver<ShutdownReason>,
 ) {
     let mut buf = [0u8; 4096];
@@ -364,8 +416,9 @@ pub async fn process_reader(
                 match res {
                     Ok(n) => {
                         if n == 0 {
-                            warn!(
-                                "Reader: socket closed by peer {} (realm {:08x})",
+                            health.tcp_peer_disconnects.fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                "Reader: client {} closed socket (realm {:08x})",
                                 peer, realm_id
                             );
                             stop_reason = "peer_closed";
@@ -375,11 +428,24 @@ pub async fn process_reader(
                         n
                     }
                     Err(e) => {
-                        warn!(
-                            "Reader error from {} (realm {:08x}): {}",
-                            peer, realm_id, e
-                        );
-                        stop_reason = "read_error";
+                        if is_peer_reset_error(&e) {
+                            log_peer_reset_event(
+                                "Reader",
+                                realm_id,
+                                peer,
+                                &channels,
+                                &health,
+                                &reset_tracker,
+                                &e,
+                            );
+                            stop_reason = "peer_reset";
+                        } else {
+                            warn!(
+                                "Reader error from {} (realm {:08x}): {}",
+                                peer, realm_id, e
+                            );
+                            stop_reason = "read_error";
+                        }
                         let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
                         break;
                     }
@@ -448,11 +514,7 @@ pub async fn dh_writer(
                     realm, remote_port
                 );
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!(
-                        "PTCP bind send error for realm {:08x}: {}",
-                        realm,
-                        e
-                    );
+                    log::error!("PTCP bind send error for realm {:08x}: {}", realm, e);
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
                         let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
@@ -465,11 +527,7 @@ pub async fn dh_writer(
                     .unwrap()
                     .send(PTCPBody::Status(realm, "DISC".to_string()));
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!(
-                        "PTCP disconnect send error for realm {:08x}: {}",
-                        realm,
-                        e
-                    );
+                    log::error!("PTCP disconnect send error for realm {:08x}: {}", realm, e);
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
                         let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
@@ -493,18 +551,16 @@ pub async fn dh_writer(
                 log_fd_state("dh_writer disconnect", &channels, &conn_channels);
             }
             PTCPEvent::Data(realm, data) => {
-                health.bytes_to_device.fetch_add(data.len() as u64, Ordering::Relaxed);
+                health
+                    .bytes_to_device
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
                 health.packets_to_device.fetch_add(1, Ordering::Relaxed);
                 let p = session
                     .lock()
                     .unwrap()
                     .send(PTCPBody::Payload(PTCPPayload { realm, data }));
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!(
-                        "PTCP payload send error for realm {:08x}: {}",
-                        realm,
-                        e
-                    );
+                    log::error!("PTCP payload send error for realm {:08x}: {}", realm, e);
                     if e.kind() == std::io::ErrorKind::ConnectionRefused {
                         let _ = shutdown_tx.send(ShutdownReason::Restart);
                         break;
@@ -576,15 +632,66 @@ async fn send_to_clients(
 fn update_max(atomic: &AtomicU64, value: u64) {
     let mut current = atomic.load(Ordering::Relaxed);
     while value > current {
-        match atomic.compare_exchange(
-            current,
-            value,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        match atomic.compare_exchange(current, value, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(v) => current = v,
         }
+    }
+}
+
+fn is_peer_reset_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+fn log_peer_reset_event(
+    source: &str,
+    realm_id: u32,
+    peer: SocketAddr,
+    channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    health: &Arc<HealthCounters>,
+    reset_tracker: &Arc<ResetBurstTracker>,
+    error: &std::io::Error,
+) {
+    health.tcp_peer_resets.fetch_add(1, Ordering::Relaxed);
+    health.tcp_peer_disconnects.fetch_add(1, Ordering::Relaxed);
+    let (resets_last_min, burst) = reset_tracker.record();
+    let active_realms = channels.lock().unwrap().len();
+    let drops_newest = health.drops_newest.load(Ordering::Relaxed);
+    let drops_oldest = health.drops_oldest.load(Ordering::Relaxed);
+    let jitter_late_drops = health.jitter_late_drops.load(Ordering::Relaxed);
+
+    if burst {
+        health.tcp_peer_reset_bursts.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "{}: high reset burst from client {} (realm {:08x}, resets_last_min={}, active_realms={}, drops_newest={}, drops_oldest={}, jitter_late_drops={}, err={})",
+            source,
+            peer,
+            realm_id,
+            resets_last_min,
+            active_realms,
+            drops_newest,
+            drops_oldest,
+            jitter_late_drops,
+            error
+        );
+    } else {
+        info!(
+            "{}: expected client disconnect via reset {} (realm {:08x}, resets_last_min={}, active_realms={}, drops_newest={}, drops_oldest={}, jitter_late_drops={}, err={})",
+            source,
+            peer,
+            realm_id,
+            resets_last_min,
+            active_realms,
+            drops_newest,
+            drops_oldest,
+            jitter_late_drops,
+            error
+        );
     }
 }
 
@@ -603,6 +710,9 @@ pub struct HealthCounters {
     pub jitter_out_bytes: AtomicU64,
     pub jitter_late_drops: AtomicU64,
     pub jitter_max_depth: AtomicU64,
+    pub tcp_peer_disconnects: AtomicU64,
+    pub tcp_peer_resets: AtomicU64,
+    pub tcp_peer_reset_bursts: AtomicU64,
 }
 
 /**
@@ -942,8 +1052,7 @@ mod tests {
                 .is_err()
         );
 
-        let (shutdown_tx, mut shutdown_rx) =
-            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
         let first = channel.recv(&mut shutdown_rx).await.unwrap();
         assert_eq!(first, b"a");
 
@@ -967,7 +1076,7 @@ mod tests {
         channel
             .push(b"a".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
             .await;
-        
+
         // Close the channel
         channel.close();
         assert!(channel.is_closed());
@@ -977,7 +1086,8 @@ mod tests {
             .push(b"b".to_vec(), 10, DropPolicy::DropNewest, 1, &health)
             .await;
 
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
+        let (_shutdown_tx, mut shutdown_rx) =
+            watch::channel::<ShutdownReason>(ShutdownReason::Stop);
         // Should only receive the first message
         let first = channel.recv(&mut shutdown_rx).await.unwrap();
         assert_eq!(first, b"a");
@@ -1074,8 +1184,14 @@ mod tests {
         let realm_forwarders = Arc::new(Mutex::new(HashMap::new()));
         let health = Arc::new(HealthCounters::default());
 
-        channels.lock().unwrap().insert(1, slow_realm_channel.clone());
-        channels.lock().unwrap().insert(2, fast_realm_channel.clone());
+        channels
+            .lock()
+            .unwrap()
+            .insert(1, slow_realm_channel.clone());
+        channels
+            .lock()
+            .unwrap()
+            .insert(2, fast_realm_channel.clone());
 
         // Fill slow realm queue so next push blocks under DropPolicy::Block.
         slow_realm_channel
@@ -1098,9 +1214,11 @@ mod tests {
 
         let (_shutdown_tx, mut shutdown_rx) =
             watch::channel::<ShutdownReason>(ShutdownReason::Stop);
-        let fast_recv_result =
-            tokio::time::timeout(Duration::from_millis(150), fast_realm_channel.recv(&mut shutdown_rx))
-                .await;
+        let fast_recv_result = tokio::time::timeout(
+            Duration::from_millis(150),
+            fast_realm_channel.recv(&mut shutdown_rx),
+        )
+        .await;
 
         match fast_recv_result {
             Ok(Some(data)) => assert_eq!(data, b"fast"),
@@ -1152,9 +1270,12 @@ mod tests {
 
         let (_shutdown_tx, mut shutdown_rx) =
             watch::channel::<ShutdownReason>(ShutdownReason::Stop);
-        let recv = tokio::time::timeout(Duration::from_millis(200), new_channel.recv(&mut shutdown_rx))
-            .await
-            .expect("new channel should receive forwarded payload");
+        let recv = tokio::time::timeout(
+            Duration::from_millis(200),
+            new_channel.recv(&mut shutdown_rx),
+        )
+        .await
+        .expect("new channel should receive forwarded payload");
         assert_eq!(recv.expect("new channel closed unexpectedly"), b"new");
     }
 
@@ -1311,7 +1432,11 @@ mod tests {
             .push(b"seed".to_vec(), 1, DropPolicy::Block, 1, &health)
             .await;
         send_to_clients(
-            vec![(1, b"q1".to_vec()), (1, b"q2".to_vec()), (1, b"q3".to_vec())],
+            vec![
+                (1, b"q1".to_vec()),
+                (1, b"q2".to_vec()),
+                (1, b"q3".to_vec()),
+            ],
             &channels,
             &realm_forwarders,
             DropPolicy::Block,
@@ -1329,7 +1454,10 @@ mod tests {
                 break;
             }
         }
-        assert!(removed, "forwarder should be removed after close with backlog");
+        assert!(
+            removed,
+            "forwarder should be removed after close with backlog"
+        );
     }
 
     #[tokio::test]
@@ -1386,8 +1514,12 @@ mod tests {
 
         let (_shutdown_tx, mut shutdown_rx) =
             watch::channel::<ShutdownReason>(ShutdownReason::Stop);
-        let got = tokio::time::timeout(Duration::from_millis(300), new.recv(&mut shutdown_rx)).await;
-        assert!(got.is_ok(), "new channel should receive packets after reconnect");
+        let got =
+            tokio::time::timeout(Duration::from_millis(300), new.recv(&mut shutdown_rx)).await;
+        assert!(
+            got.is_ok(),
+            "new channel should receive packets after reconnect"
+        );
     }
 
     #[tokio::test]
@@ -1508,5 +1640,46 @@ mod tests {
 
         let _ = shutdown_tx.send(ShutdownReason::Restart);
         reader_handle.await.unwrap();
+    }
+
+    #[test]
+    fn reset_burst_tracker_only_escalates_after_threshold() {
+        let tracker = ResetBurstTracker::new(Duration::from_secs(60), 3);
+        let base = std::time::Instant::now();
+
+        let (count1, warn1) = tracker.record_at(base);
+        let (count2, warn2) = tracker.record_at(base + Duration::from_secs(1));
+        let (count3, warn3) = tracker.record_at(base + Duration::from_secs(2));
+        let (count4, warn4) = tracker.record_at(base + Duration::from_secs(3));
+
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 2);
+        assert_eq!(count3, 3);
+        assert_eq!(count4, 4);
+        assert!(!warn1, "single reset should be treated as expected churn");
+        assert!(!warn2, "below-threshold reset burst should stay info-level");
+        assert!(!warn3, "threshold boundary should not escalate yet");
+        assert!(warn4, "burst above threshold should escalate to warning");
+    }
+
+    #[test]
+    fn reset_burst_tracker_forgets_old_events_outside_window() {
+        let tracker = ResetBurstTracker::new(Duration::from_secs(60), 2);
+        let base = std::time::Instant::now();
+
+        let (count1, _) = tracker.record_at(base);
+        let (count2, _) = tracker.record_at(base + Duration::from_secs(1));
+        let (count3, warn3) = tracker.record_at(base + Duration::from_secs(62));
+
+        assert_eq!(count1, 1);
+        assert_eq!(count2, 2);
+        assert_eq!(
+            count3, 1,
+            "events older than one minute should not affect per-minute burst count"
+        );
+        assert!(
+            !warn3,
+            "a reset outside previous burst window should not trigger warning escalation"
+        );
     }
 }

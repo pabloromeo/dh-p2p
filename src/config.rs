@@ -22,6 +22,7 @@ pub struct Config {
     pub handshake_timeout_secs: u64,
     pub realm_ready_timeout_secs: u64,
     pub max_pending_realm_setups: usize,
+    pub reset_burst_warn_threshold_per_minute: u64,
     pub channel_capacity: usize,
     pub drop_policy: DropPolicy,
     pub jitter_buffer_ms: u64,
@@ -42,6 +43,7 @@ impl Default for Config {
             handshake_timeout_secs: 15,
             realm_ready_timeout_secs: 10,
             max_pending_realm_setups: 128,
+            reset_burst_warn_threshold_per_minute: 20,
             channel_capacity: 128,
             drop_policy: DropPolicy::Block,
             jitter_buffer_ms: 0,
@@ -60,5 +62,3 @@ mod tests {
         let _c = DropPolicy::DropOldestKeepLatest;
     }
 }
-
-

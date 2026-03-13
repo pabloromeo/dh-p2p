@@ -1,3 +1,4 @@
+use axum::{extract::State, http::StatusCode, routing::get, serve, Router};
 use clap::Parser;
 use log::{debug, info, warn};
 use std::{
@@ -9,7 +10,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use axum::{extract::State, http::StatusCode, routing::get, serve, Router};
 #[cfg(unix)]
 use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use tokio::{
@@ -23,7 +23,7 @@ use crate::{
     config::{Config, DropPolicy},
     fdlog::log_fd_snapshot,
     metrics::{InMemoryMetrics, MetricsHandle},
-    process::{dh_reader, dh_writer, ClientChannel, HealthCounters},
+    process::{dh_reader, dh_writer, ClientChannel, HealthCounters, ResetBurstTracker},
     shutdown::ShutdownReason,
     transport::{handshake::p2p_handshake, ptcp::PTCPEvent},
 };
@@ -75,16 +75,31 @@ struct Cli {
     #[arg(short = 'b', long, value_name = "ms", default_value = "0")]
     buffer_ms: u64,
     /// Drop policy for slow clients: block|drop_newest|keep_latest
-    #[arg(short = 'd', long = "drop-policy", value_name = "policy", default_value = "block")]
+    #[arg(
+        short = 'd',
+        long = "drop-policy",
+        value_name = "policy",
+        default_value = "block"
+    )]
     drop_policy: String,
     /// Health log interval in seconds (0 disables health logging)
-    #[arg(short = 'H', long = "health-interval-secs", value_name = "secs", default_value = "60")]
+    #[arg(
+        short = 'H',
+        long = "health-interval-secs",
+        value_name = "secs",
+        default_value = "60"
+    )]
     health_interval_secs: u64,
     /// Enable HTTP probe server (/livez, /readyz)
     #[arg(short = 'e', long = "enable-probe", default_value_t = false)]
     enable_probe: bool,
     /// HTTP probe listen port
-    #[arg(short = 'P', long = "probe-port", value_name = "port", default_value = "8080")]
+    #[arg(
+        short = 'P',
+        long = "probe-port",
+        value_name = "port",
+        default_value = "8080"
+    )]
     probe_port: u16,
     /// Max concurrent pending realm setup waits
     #[arg(
@@ -93,6 +108,13 @@ struct Cli {
         default_value = "128"
     )]
     max_pending_realm_setups: usize,
+    /// Warn only when reset-by-peer bursts exceed this count per minute (0 disables escalation)
+    #[arg(
+        long = "reset-burst-warn-threshold-per-minute",
+        value_name = "count",
+        default_value = "20"
+    )]
+    reset_burst_warn_threshold_per_minute: u64,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -126,6 +148,7 @@ async fn main() {
     config.enable_probe = args.enable_probe;
     config.probe_port = args.probe_port;
     config.max_pending_realm_setups = args.max_pending_realm_setups.max(1);
+    config.reset_burst_warn_threshold_per_minute = args.reset_burst_warn_threshold_per_minute;
     config.drop_policy = match args.drop_policy.as_str() {
         "block" => DropPolicy::Block,
         "drop_newest" => DropPolicy::DropNewest,
@@ -241,6 +264,10 @@ async fn run_server_once(
     let session = Arc::new(Mutex::new(session));
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let health = Arc::new(HealthCounters::default());
+    let reset_tracker = Arc::new(ResetBurstTracker::new(
+        Duration::from_secs(60),
+        config.reset_burst_warn_threshold_per_minute,
+    ));
     let probe_state = ProbeState::default();
     let probe_state_opt = if config.enable_probe {
         Some(probe_state.clone())
@@ -452,8 +479,14 @@ async fn run_server_once(
                             health_counters.jitter_late_drops.swap(0, Ordering::Relaxed);
                         let jitter_max_depth =
                             health_counters.jitter_max_depth.swap(0, Ordering::Relaxed);
+                        let tcp_peer_disconnects =
+                            health_counters.tcp_peer_disconnects.swap(0, Ordering::Relaxed);
+                        let tcp_peer_resets =
+                            health_counters.tcp_peer_resets.swap(0, Ordering::Relaxed);
+                        let tcp_peer_reset_bursts =
+                            health_counters.tcp_peer_reset_bursts.swap(0, Ordering::Relaxed);
                         info!(
-                            "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={}",
+                            "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={} tcp_peer_disconnects={} tcp_peer_resets={} tcp_peer_reset_bursts={}",
                             realms,
                             waiters,
                             bytes_in,
@@ -471,6 +504,9 @@ async fn run_server_once(
                             jitter_out_bytes,
                             jitter_late_drops,
                             jitter_max_depth,
+                            tcp_peer_disconnects,
+                            tcp_peer_resets,
+                            tcp_peer_reset_bursts,
                         );
                     }
                     _ = health_shutdown.changed() => break,
@@ -524,12 +560,14 @@ async fn run_server_once(
     let mut shutdown_accept = shutdown_rx.clone();
     let accept_pipeline = AcceptPipeline::new(
         AcceptDeps::new(
-        config.clone(),
-        metrics.clone(),
-        dh_tx.clone(),
-        channels2.clone(),
-        conn_channels2.clone(),
-        shutdown_rx.clone(),
+            config.clone(),
+            metrics.clone(),
+            dh_tx.clone(),
+            health.clone(),
+            reset_tracker.clone(),
+            channels2.clone(),
+            conn_channels2.clone(),
+            shutdown_rx.clone(),
         ),
         AcceptLimits::new(config.max_pending_realm_setups),
     );
@@ -593,7 +631,10 @@ async fn run_server_once(
         let _ = shutdown_handle.await;
     }
 
-    info!("run_server_once completed with reason {:?}", shutdown_reason);
+    info!(
+        "run_server_once completed with reason {:?}",
+        shutdown_reason
+    );
     shutdown_reason
 }
 
@@ -616,4 +657,3 @@ async fn wait_for_shutdown_signal() {
         info!("Received Ctrl+C");
     }
 }
-

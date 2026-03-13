@@ -3,4 +3,3 @@ pub enum ShutdownReason {
     Stop,
     Restart,
 }
-

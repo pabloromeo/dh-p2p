@@ -18,4 +18,3 @@ impl Metrics for InMemoryMetrics {
         *map.entry(name.to_string()).or_insert(0) += 1;
     }
 }
-

@@ -253,7 +253,10 @@ pub async fn p2p_handshake(
     if result.is_err() {
         warn!("Timeout occurred while waiting for a response from the device.");
         warn!("If the issue persists, you may need to use relay mode (--relay) with this device.");
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "Device response timeout"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Device response timeout",
+        ));
     }
 
     let n = result.unwrap().unwrap();
@@ -504,4 +507,3 @@ impl DHP2P for UdpSocket {
         res
     }
 }
-
