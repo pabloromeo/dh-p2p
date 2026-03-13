@@ -145,7 +145,7 @@ Near `u32` boundary, multiple packets satisfy current wrap condition while `last
 
 ---
 
-## 6) Harden handshake/parser path by removing panic/unwrap/assert on network data (medium priority)
+## 6) Harden handshake/parser path by removing panic/unwrap/assert on network data (medium priority) - COMPLETED
 
 **Problem**  
 Handshake and protocol parse paths still use panic-prone operations (`unwrap/assert/panic`) on external data.
@@ -161,6 +161,12 @@ Handshake and protocol parse paths still use panic-prone operations (`unwrap/ass
 **Success criteria**
 - No process crash from malformed packet/response inputs.
 - Errors are logged with context and handled via restart/recovery paths.
+
+**Completion notes (2026-03-13)**
+- Reworked handshake and DH parsing in `src/transport/handshake.rs` to replace panic-prone paths with explicit `io::Result` error propagation, including safer header/body parsing and guarded protocol-state checks.
+- Reworked PTCP parsing in `src/transport/ptcp.rs` to return structured malformed-data errors instead of assertions for undersized/invalid packets and bodies.
+- Added and expanded regression tests for malformed headers, malformed XML/response formats, malformed PTCP payloads/packets, plus randomized no-panic parser stability tests.
+- Verified with focused transport tests, full `cargo test`, and rebuilt release binary via `cargo build --release`.
 
 ---
 
@@ -231,6 +237,7 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 1. Mark the item heading with `- COMPLETED`.
 2. Add/update completion notes under that item with date and scope.
 3. Update the checklist below by switching `[ ]` to `[x]`.
+4. Rebuild the release binary after tests are passing (`cargo build --release`).
 
 **Checklist**
 - [x] 1) Prevent global head-of-line blocking in device->client forwarding
@@ -238,7 +245,7 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 - [x] 3) Keep runtime policy optimized for live streams
 - [x] 4) Reduce jitter wraparound log noise and correct wrap accounting
 - [x] 5) Reclassify and enrich reset-by-peer logs
-- [ ] 6) Harden handshake/parser path by removing panic/unwrap/assert on network data
+- [x] 6) Harden handshake/parser path by removing panic/unwrap/assert on network data
 - [ ] 7) Add realm ID collision protection
 - [ ] 8) Improve observability for real root-cause analysis
 - [ ] 9) Run controlled soak tests after each change

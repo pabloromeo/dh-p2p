@@ -38,9 +38,19 @@ pub struct PTCPPacket {
 }
 
 impl PTCPPayload {
-    fn parse(data: &[u8]) -> PTCPPayload {
-        assert!(data.len() >= 12, "Invalid payload");
-        assert_eq!(data[0], 0x10, "Invalid header");
+    fn parse(data: &[u8]) -> Result<PTCPPayload, PTCPReadError> {
+        if data.len() < 12 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid payload: expected at least 12 bytes, got {}",
+                data.len()
+            )));
+        }
+        if data[0] != 0x10 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid payload header: expected 0x10, got 0x{:02x}",
+                data[0]
+            )));
+        }
 
         let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let length = header & 0xFFFF;
@@ -48,10 +58,21 @@ impl PTCPPayload {
         let padding = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         let data = data[12..].to_vec();
 
-        assert_eq!(padding, 0, "Invalid padding");
-        assert_eq!(length, data.len() as u32, "Invalid length");
+        if padding != 0 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid payload padding: expected 0, got {}",
+                padding
+            )));
+        }
+        if length != data.len() as u32 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid payload length: header says {}, body is {}",
+                length,
+                data.len()
+            )));
+        }
 
-        PTCPPayload { realm, data }
+        Ok(PTCPPayload { realm, data })
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -124,27 +145,46 @@ impl std::fmt::Debug for PTCPPacket {
 }
 
 impl PTCPBody {
-    fn parse(data: &[u8]) -> PTCPBody {
+    fn parse(data: &[u8]) -> Result<PTCPBody, PTCPReadError> {
         if data.len() == 0 {
-            return PTCPBody::Empty;
+            return Ok(PTCPBody::Empty);
         }
 
-        assert!(data.len() >= 4, "Invalid body");
+        if data.len() < 4 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid body: expected at least 4 bytes, got {}",
+                data.len()
+            )));
+        }
 
         match data[0] {
-            0x00 => PTCPBody::Sync,
-            0x10 => PTCPBody::Payload(PTCPPayload::parse(data)),
-            0x11 => PTCPBody::Bind(
-                u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
-                u32::from_be_bytes([data[12], data[13], data[14], data[15]]),
-            ),
+            0x00 => Ok(PTCPBody::Sync),
+            0x10 => Ok(PTCPBody::Payload(PTCPPayload::parse(data)?)),
+            0x11 => {
+                if data.len() < 16 {
+                    return Err(PTCPReadError::Malformed(format!(
+                        "invalid bind body: expected at least 16 bytes, got {}",
+                        data.len()
+                    )));
+                }
+                Ok(PTCPBody::Bind(
+                    u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+                    u32::from_be_bytes([data[12], data[13], data[14], data[15]]),
+                ))
+            }
             0x12 => {
+                if data.len() < 12 {
+                    return Err(PTCPReadError::Malformed(format!(
+                        "invalid status body: expected at least 12 bytes, got {}",
+                        data.len()
+                    )));
+                }
                 let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
                 let status = String::from_utf8_lossy(&data[12..]).to_string();
-                PTCPBody::Status(realm, status)
+                Ok(PTCPBody::Status(realm, status))
             }
-            0x13 => PTCPBody::Heartbeat,
-            _ => PTCPBody::Command(data.to_vec()),
+            0x13 => Ok(PTCPBody::Heartbeat),
+            _ => Ok(PTCPBody::Command(data.to_vec())),
         }
     }
 
@@ -187,28 +227,38 @@ impl PTCPBody {
 }
 
 impl PTCPPacket {
-    fn parse(data: &[u8]) -> PTCPPacket {
-        assert!(data.len() >= 24, "Invalid packet");
+    fn parse(data: &[u8]) -> Result<PTCPPacket, PTCPReadError> {
+        if data.len() < 24 {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid packet: expected at least 24 bytes, got {}",
+                data.len()
+            )));
+        }
 
         let magic = &data[0..4];
 
-        assert_eq!(magic, b"PTCP", "Invalid magic");
+        if magic != b"PTCP" {
+            return Err(PTCPReadError::Malformed(format!(
+                "invalid packet magic: expected PTCP, got {:02x?}",
+                magic
+            )));
+        }
 
         let sent = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let recv = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
         let pid = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
         let lmid = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
         let rmid = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
-        let body = PTCPBody::parse(&data[24..]);
+        let body = PTCPBody::parse(&data[24..])?;
 
-        PTCPPacket {
+        Ok(PTCPPacket {
             sent,
             recv,
             pid,
             lmid,
             rmid,
             body,
-        }
+        })
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -356,7 +406,11 @@ pub trait PTCP {
 #[async_trait]
 impl PTCP for UdpSocket {
     async fn ptcp_request(&self, packet: PTCPPacket) -> io::Result<()> {
-        debug!(">>> {} {:?}", self.peer_addr().unwrap(), packet.body);
+        if let Ok(peer) = self.peer_addr() {
+            debug!(">>> {} {:?}", peer, packet.body);
+        } else {
+            debug!(">>> <unconnected> {:?}", packet.body);
+        }
         trace!("{:?}", packet);
         packet.try_print_data();
         trace!("---");
@@ -369,7 +423,11 @@ impl PTCP for UdpSocket {
     }
 
     async fn ptcp_read(&self) -> Result<PTCPPacket, PTCPReadError> {
-        trace!("### {}", self.peer_addr().unwrap());
+        if let Ok(peer) = self.peer_addr() {
+            trace!("### {}", peer);
+        } else {
+            trace!("### <unconnected>");
+        }
 
         // Larger buffer for video frames
         let mut buf = [0u8; 65535];
@@ -409,8 +467,12 @@ impl PTCP for UdpSocket {
             return Err(PTCPReadError::Malformed(msg));
         }
 
-        let packet = PTCPPacket::parse(&buf[0..n]);
-        debug!("<<< {} {:?}", self.peer_addr().unwrap(), packet.body);
+        let packet = PTCPPacket::parse(&buf[0..n])?;
+        if let Ok(peer) = self.peer_addr() {
+            debug!("<<< {} {:?}", peer, packet.body);
+        } else {
+            debug!("<<< <unconnected> {:?}", packet.body);
+        }
         trace!("{:?}", packet);
         packet.try_print_data();
         trace!("---");
@@ -422,6 +484,8 @@ impl PTCP for UdpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::panic;
 
     #[test]
     fn test_pid_calculation_normal() {
@@ -516,5 +580,116 @@ mod tests {
         let packet = session.send(PTCPBody::Heartbeat);
         assert_eq!(packet.sent, 12); // Second packet starts at 12
         assert_eq!(session.sent, 24); // After sending, sent = 24
+    }
+
+    #[test]
+    fn parse_rejects_undersized_packet() {
+        let data = vec![0u8; 10];
+        assert!(matches!(
+            PTCPPacket::parse(&data),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_magic() {
+        let mut data = vec![0u8; 24];
+        data[0..4].copy_from_slice(b"XXXX");
+        assert!(matches!(
+            PTCPPacket::parse(&data),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_undersized_bind_body() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PTCP");
+        data.extend_from_slice(&0u32.to_be_bytes()); // sent
+        data.extend_from_slice(&0u32.to_be_bytes()); // recv
+        data.extend_from_slice(&0u32.to_be_bytes()); // pid
+        data.extend_from_slice(&0u32.to_be_bytes()); // lmid
+        data.extend_from_slice(&0u32.to_be_bytes()); // rmid
+        data.extend_from_slice(&[0x11, 0x00, 0x00, 0x00]); // bind tag, too short
+        assert!(matches!(
+            PTCPPacket::parse(&data),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_payload_length() {
+        let payload = [
+            0x10, 0x00, 0x00, 0x05, // header says length 5
+            0x00, 0x00, 0x00, 0x01, // realm
+            0x00, 0x00, 0x00, 0x00, // padding
+            0xaa, 0xbb, // actual payload is 2 bytes
+        ];
+        assert!(matches!(
+            PTCPPayload::parse(&payload),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_payload_header_byte() {
+        let payload = [
+            0x11, 0x00, 0x00, 0x02, // invalid header type for payload parser
+            0x00, 0x00, 0x00, 0x01, // realm
+            0x00, 0x00, 0x00, 0x00, // padding
+            0xaa, 0xbb,
+        ];
+        assert!(matches!(
+            PTCPPayload::parse(&payload),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_non_zero_payload_padding() {
+        let payload = [
+            0x10, 0x00, 0x00, 0x02, // header says length 2
+            0x00, 0x00, 0x00, 0x01, // realm
+            0x00, 0x00, 0x00, 0x01, // invalid padding
+            0xaa, 0xbb,
+        ];
+        assert!(matches!(
+            PTCPPayload::parse(&payload),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_undersized_status_body() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PTCP");
+        data.extend_from_slice(&0u32.to_be_bytes()); // sent
+        data.extend_from_slice(&0u32.to_be_bytes()); // recv
+        data.extend_from_slice(&0u32.to_be_bytes()); // pid
+        data.extend_from_slice(&0u32.to_be_bytes()); // lmid
+        data.extend_from_slice(&0u32.to_be_bytes()); // rmid
+        data.extend_from_slice(&[
+            0x12, 0x00, 0x00, 0x00, // status tag
+            0x00, 0x00, 0x00, 0x01, // realm
+        ]); // only 8 body bytes; status requires at least 12
+        assert!(matches!(
+            PTCPPacket::parse(&data),
+            Err(PTCPReadError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_random_inputs_do_not_panic() {
+        let mut rng = StdRng::seed_from_u64(0x5EED_1234);
+        for _ in 0..2500 {
+            let len = rng.gen_range(0..512);
+            let data: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+            let result = panic::catch_unwind(|| {
+                let _ = PTCPPacket::parse(&data);
+                let _ = PTCPBody::parse(&data);
+                let _ = PTCPPayload::parse(&data);
+            });
+            assert!(result.is_ok(), "parse panicked for len {}", len);
+        }
     }
 }
