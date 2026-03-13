@@ -9,9 +9,31 @@ use xml::reader::{EventReader, XmlEvent};
 use super::ptcp::{PTCPBody, PTCPPacket, PTCPSession, PTCP};
 
 static MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
+const RELAY_STOP_TIMEOUT: time::Duration = time::Duration::from_secs(2);
 
 static USERNAME: &str = "cba1b29e32cb17aa46b8ff9e73c7f40b";
 static USERKEY: &str = "996103384cdf19179e19243e959bbf8b";
+
+#[derive(Clone, Debug)]
+pub struct RelayLease {
+    token: String,
+    agent: String,
+}
+
+impl RelayLease {
+    pub async fn release(self) {
+        if let Err(e) = release_relay_session(&self.token, &self.agent).await {
+            warn!(
+                "Failed to release relay session (agent={}, token_len={}): {}",
+                self.agent,
+                self.token.len(),
+                e
+            );
+        } else {
+            info!("Released relay session for agent {}", self.agent);
+        }
+    }
+}
 
 fn ip_to_bytes(ip: &str) -> io::Result<Vec<u8>> {
     let addr: SocketAddrV4 = ip.parse().map_err(|e| {
@@ -253,6 +275,32 @@ async fn establish_relay_channel(
     }
 }
 
+async fn release_relay_session(token: &str, agent: &str) -> io::Result<()> {
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let mut cseq = 0;
+    time::timeout(RELAY_STOP_TIMEOUT, socket.connect(agent))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to relay agent"))??;
+    time::timeout(
+        RELAY_STOP_TIMEOUT,
+        socket.dh_request(format!("/relay/stop/{}", token).as_ref(), None, &mut cseq),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out sending /relay/stop"))??;
+    // Best-effort cleanup: some relay agents may not acknowledge stop,
+    // and UDP replies can be dropped. A missing response should not fail shutdown.
+    match time::timeout(RELAY_STOP_TIMEOUT, socket.dh_read()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!("relay stop returned error response, continuing anyway: {}", e);
+        }
+        Err(_) => {
+            debug!("relay stop returned no response before timeout; continuing");
+        }
+    }
+    Ok(())
+}
+
 async fn negotiate_relay_sign(socket2: &UdpSocket, session: &mut PTCPSession) -> io::Result<Vec<u8>> {
     socket2
         .ptcp_request(session.send(PTCPBody::Command(
@@ -415,7 +463,7 @@ pub async fn p2p_handshake(
     socket: UdpSocket,
     serial: String,
     relay_mode: bool,
-) -> io::Result<(UdpSocket, PTCPSession)> {
+) -> io::Result<(UdpSocket, PTCPSession, Option<RelayLease>)> {
     let mut cseq = 0;
     let start = Instant::now();
 
@@ -435,7 +483,11 @@ pub async fn p2p_handshake(
     request_p2p_channel(&socket, &serial, &cid, &mut cseq).await?;
 
     info!("Setting up relay connection...");
-    let (_token, agent) = setup_relay_agent(&socket2, &relay, &mut cseq).await?;
+    let (token, agent) = setup_relay_agent(&socket2, &relay, &mut cseq).await?;
+    let relay_lease = Some(RelayLease {
+        token,
+        agent: agent.clone(),
+    });
     let res = wait_device_channel_response(&socket).await?;
 
     let device_laddr = response_body_field(&res, "body/LocalAddr")?;
@@ -458,7 +510,7 @@ pub async fn p2p_handshake(
 
     if relay_mode {
         info!("Relay mode enabled");
-        return Ok((socket2, session));
+        return Ok((socket2, session, relay_lease));
     }
 
     let sign = negotiate_relay_sign(&socket2, &mut session).await?;
@@ -475,7 +527,7 @@ pub async fn p2p_handshake(
         relay_mode,
         start.elapsed().as_millis()
     );
-    Ok((socket, session))
+    Ok((socket, session, relay_lease))
 }
 
 #[derive(Debug)]

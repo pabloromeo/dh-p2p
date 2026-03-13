@@ -243,7 +243,7 @@ async fn run_server_once(
     )
     .await;
 
-    let (socket, session) = match handshake {
+    let (socket, session, relay_lease) = match handshake {
         Ok(Ok(res)) => res,
         Ok(Err(e)) => {
             warn!("P2P handshake failed: {}", e);
@@ -636,6 +636,9 @@ async fn run_server_once(
     }
     if let Some(handle) = probe_handle {
         let _ = handle.await;
+    }
+    if let Some(lease) = relay_lease {
+        lease.release().await;
     }
 
     if shutdown_reason == ShutdownReason::Restart {
