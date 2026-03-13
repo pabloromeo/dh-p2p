@@ -49,6 +49,8 @@ pub struct JitterBuffer {
     late_dropped: u64,
     /// Count of detected wraparounds (for debugging)
     wraparound_count: u64,
+    /// Suppresses repeated wraparound logs/counts while still in the same crossing window.
+    wraparound_crossing_active: bool,
 }
 
 impl JitterBuffer {
@@ -63,6 +65,7 @@ impl JitterBuffer {
             packets_out: 0,
             late_dropped: 0,
             wraparound_count: 0,
+            wraparound_crossing_active: false,
         }
     }
 
@@ -136,13 +139,19 @@ impl JitterBuffer {
                 return vec![];
             }
 
-            // Detect and log wraparound for monitoring
-            if seq < last && seq_after(seq, last) {
-                self.wraparound_count += 1;
-                info!(
-                    "JitterBuffer: sequence wraparound detected! seq={} last={} (wraparound #{})",
-                    seq, last, self.wraparound_count
-                );
+            // Detect and log wraparound once per actual crossing window.
+            let wraparound_crossing = seq < last && seq_after(seq, last);
+            if wraparound_crossing {
+                if !self.wraparound_crossing_active {
+                    self.wraparound_count += 1;
+                    info!(
+                        "JitterBuffer: sequence wraparound detected! seq={} last={} (wraparound #{})",
+                        seq, last, self.wraparound_count
+                    );
+                    self.wraparound_crossing_active = true;
+                }
+            } else {
+                self.wraparound_crossing_active = false;
             }
         }
 
@@ -544,5 +553,21 @@ mod tests {
         assert_eq!(all[2].1, vec![4]); // 0
         assert_eq!(all[3].1, vec![5]); // 1
         assert_eq!(all[4].1, vec![6]); // 2
+    }
+
+    #[test]
+    fn test_jitter_buffer_wraparound_count_once_per_crossing_window() {
+        let mut jb = JitterBuffer::new(Duration::from_millis(100));
+
+        // Simulate that we already released a packet near the u32 boundary.
+        jb.last_released_seq = Some(u32::MAX - 1);
+
+        // Multiple post-wrap packets arrive while last_released_seq is still pre-wrap.
+        let _ = jb.insert(0, 1, vec![1]);
+        let _ = jb.insert(1, 1, vec![2]);
+        let _ = jb.insert(2, 1, vec![3]);
+
+        // Should count/log wraparound once for this crossing window.
+        assert_eq!(jb.wraparound_count, 1);
     }
 }

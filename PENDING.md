@@ -75,7 +75,7 @@ After `listener.accept()`, the code waits for `conn_rx` (`realm ready`) before p
 
 ---
 
-## 3) Keep runtime policy optimized for live streams (high operational priority)
+## 3) Keep runtime policy optimized for live streams (high operational priority) - COMPLETED
 
 **Current**
 - `--drop-policy keep_latest` (good)
@@ -90,9 +90,13 @@ After `listener.accept()`, the code waits for `conn_rx` (`realm ready`) before p
 - Lower reconnect/reset frequency from Frigate.
 - Better end-to-end latency and fewer queue pressure events.
 
+**Completion notes (2026-03-13)**
+- Runtime tuning was completed in the production cluster environment.
+- Live-stream policy kept on `--drop-policy keep_latest` with operational jitter buffer tuning validated in-cluster.
+
 ---
 
-## 4) Reduce jitter wraparound log noise and correct wrap accounting (medium priority)
+## 4) Reduce jitter wraparound log noise and correct wrap accounting (medium priority) - COMPLETED
 
 **Problem**  
 `JitterBuffer` wraparound detection logs can spam many lines per second and overcount wraps.
@@ -108,6 +112,11 @@ Near `u32` boundary, multiple packets satisfy current wrap condition while `last
 **Success criteria**
 - Wraparound logs become sparse and meaningful.
 - `wraparound_count` reflects actual wrap events rather than packet bursts.
+
+**Completion notes (2026-03-13)**
+- Updated `JitterBuffer` wraparound detection to count/log once per crossing window using explicit crossing state reset logic.
+- Kept wraparound logs at current level (no downgrade to `debug`) while reducing repeated noise.
+- Added regression coverage to ensure multiple post-wrap packets in the same crossing window increment `wraparound_count` only once.
 
 ---
 
@@ -220,8 +229,8 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 **Checklist**
 - [x] 1) Prevent global head-of-line blocking in device->client forwarding
 - [x] 2) Make TCP accept path non-serial
-- [ ] 3) Keep runtime policy optimized for live streams
-- [ ] 4) Reduce jitter wraparound log noise and correct wrap accounting
+- [x] 3) Keep runtime policy optimized for live streams
+- [x] 4) Reduce jitter wraparound log noise and correct wrap accounting
 - [ ] 5) Reclassify and enrich reset-by-peer logs
 - [ ] 6) Harden handshake/parser path by removing panic/unwrap/assert on network data
 - [ ] 7) Add realm ID collision protection
