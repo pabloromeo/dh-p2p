@@ -19,16 +19,16 @@ use tokio::{
 };
 
 use crate::{
+    accept::{schedule_client_setup, AcceptDeps, AcceptLimits, AcceptPipeline},
     config::{Config, DropPolicy},
     fdlog::log_fd_snapshot,
     metrics::{InMemoryMetrics, MetricsHandle},
-    process::{
-        dh_reader, dh_writer, process_reader, process_writer, ClientChannel, HealthCounters,
-    },
+    process::{dh_reader, dh_writer, ClientChannel, HealthCounters},
     shutdown::ShutdownReason,
     transport::{handshake::p2p_handshake, ptcp::PTCPEvent},
 };
 
+mod accept;
 mod buffer;
 mod config;
 mod fdlog;
@@ -86,6 +86,13 @@ struct Cli {
     /// HTTP probe listen port
     #[arg(short = 'P', long = "probe-port", value_name = "port", default_value = "8080")]
     probe_port: u16,
+    /// Max concurrent pending realm setup waits
+    #[arg(
+        long = "max-pending-realm-setups",
+        value_name = "count",
+        default_value = "128"
+    )]
+    max_pending_realm_setups: usize,
     /// Increase verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -118,6 +125,7 @@ async fn main() {
     config.health_interval_secs = args.health_interval_secs;
     config.enable_probe = args.enable_probe;
     config.probe_port = args.probe_port;
+    config.max_pending_realm_setups = args.max_pending_realm_setups.max(1);
     config.drop_policy = match args.drop_policy.as_str() {
         "block" => DropPolicy::Block,
         "drop_newest" => DropPolicy::DropNewest,
@@ -514,6 +522,17 @@ async fn run_server_once(
     }
 
     let mut shutdown_accept = shutdown_rx.clone();
+    let accept_pipeline = AcceptPipeline::new(
+        AcceptDeps::new(
+        config.clone(),
+        metrics.clone(),
+        dh_tx.clone(),
+        channels2.clone(),
+        conn_channels2.clone(),
+        shutdown_rx.clone(),
+        ),
+        AcceptLimits::new(config.max_pending_realm_setups),
+    );
     let shutdown_reason;
     loop {
         // The second item contains the IP and port of the new connection.
@@ -532,100 +551,8 @@ async fn run_server_once(
                 break;
             }
         };
-        let client_connected_at = Instant::now();
-        info!("Accepted TCP client {}", addr);
-        metrics.inc_counter("client_accept");
-
-        // Create a channel for the client
-        let channel = ClientChannel::new();
-        let (conn_tx, conn_rx) = oneshot::channel::<bool>();
-        let dh_tx = dh_tx.clone();
-        let _shutdown_conn = shutdown_rx.clone();
-
         let realm_id = rand::random::<u32>();
-        info!(
-            "Client {} assigned realm {:08x}; enqueuing PTCP Connect",
-            addr, realm_id
-        );
-
-        // Store the channel in the map
-        channels2.lock().unwrap().insert(realm_id, channel.clone());
-        conn_channels2.lock().unwrap().insert(realm_id, conn_tx);
-        {
-            let chans = channels2.lock().unwrap();
-            let conns = conn_channels2.lock().unwrap();
-            log_fd_snapshot("after accept", chans.len(), conns.len());
-        }
-
-        if dh_tx.send(PTCPEvent::Connect(realm_id)).await.is_err() {
-            warn!("Failed to enqueue connect event for realm {:08x}", realm_id);
-            continue;
-        }
-
-        info!(
-            "Waiting for realm {:08x} to become ready (client {})",
-            realm_id, addr
-        );
-        let ready = tokio::time::timeout(
-            Duration::from_secs(config.realm_ready_timeout_secs),
-            conn_rx,
-        )
-        .await;
-        match ready {
-            Ok(res) => {
-                if res.is_err() {
-                    warn!(
-                        "Realm {:08x} connection handshake failed after {}ms (client {})",
-                        realm_id,
-                        client_connected_at.elapsed().as_millis(),
-                        addr
-                    );
-                    metrics.inc_counter("realm_ready_failed");
-                    channels2.lock().unwrap().remove(&realm_id);
-                    conn_channels2.lock().unwrap().remove(&realm_id);
-                    continue;
-                }
-                info!(
-                    "Realm {:08x} ready after {}ms; starting reader/writer tasks for client {}",
-                    realm_id,
-                    client_connected_at.elapsed().as_millis(),
-                    addr
-                );
-                metrics.inc_counter("realm_ready");
-            }
-            Err(_) => {
-                warn!(
-                    "Realm {:08x} ready wait timed out after {}s (client {}, elapsed_ms={})",
-                    realm_id,
-                    config.realm_ready_timeout_secs,
-                    addr,
-                    client_connected_at.elapsed().as_millis()
-                );
-                metrics.inc_counter("realm_ready_timeout");
-                channels2.lock().unwrap().remove(&realm_id);
-                conn_channels2.lock().unwrap().remove(&realm_id);
-                continue;
-            }
-        }
-
-        let (reader, writer) = client.into_split();
-
-        tokio::spawn({
-            let shutdown_rx = shutdown_rx.clone();
-            let peer = addr;
-            let dh_tx = dh_tx.clone();
-            async move {
-                process_reader(reader, realm_id, peer, dh_tx, shutdown_rx).await;
-            }
-        });
-
-        tokio::spawn({
-            let shutdown_rx = shutdown_rx.clone();
-            let channel = channel.clone();
-            async move {
-                process_writer(writer, channel, shutdown_rx).await;
-            }
-        });
+        schedule_client_setup(client, addr, realm_id, &accept_pipeline);
     }
 
     // If we exited the accept loop without observing the latest reason, read it now.
@@ -689,3 +616,4 @@ async fn wait_for_shutdown_signal() {
         info!("Received Ctrl+C");
     }
 }
+

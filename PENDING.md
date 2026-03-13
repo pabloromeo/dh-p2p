@@ -49,7 +49,7 @@ One slow TCP client can block the global PTCP reader loop, delaying packets for 
 
 ---
 
-## 2) Make TCP accept path non-serial (high priority)
+## 2) Make TCP accept path non-serial (high priority) - COMPLETED
 
 **Problem**  
 New client accepts are effectively serialized behind realm readiness handshakes (~2.2s each in current logs).
@@ -65,6 +65,13 @@ After `listener.accept()`, the code waits for `conn_rx` (`realm ready`) before p
 **Success criteria**
 - Accept cadence is independent of realm bind/ready timing.
 - No stepwise client connection delays under bursty reconnect behavior.
+
+**Completion notes (2026-03-12)**
+- Extracted accept-path scheduling/setup into dedicated `src/accept.rs` module (`AcceptDeps`, `AcceptLimits`, `AcceptPipeline`) to keep orchestration in `src/main.rs` minimal.
+- Changed accept handling to schedule per-client setup work in spawned tasks so the main listener loop immediately returns to `listener.accept()`.
+- Added a bounded pending-setup guardrail using a semaphore (`max_pending_realm_setups`) and rejection metric/log when saturated.
+- Added regression tests proving setup scheduling is no longer serialized by realm-ready waits and that excess pending setups are rejected deterministically.
+- Re-ran full test suite (`cargo test`) with all tests passing.
 
 ---
 
@@ -212,7 +219,7 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 
 **Checklist**
 - [x] 1) Prevent global head-of-line blocking in device->client forwarding
-- [ ] 2) Make TCP accept path non-serial
+- [x] 2) Make TCP accept path non-serial
 - [ ] 3) Keep runtime policy optimized for live streams
 - [ ] 4) Reduce jitter wraparound log noise and correct wrap accounting
 - [ ] 5) Reclassify and enrich reset-by-peer logs
