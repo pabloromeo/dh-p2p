@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    accept::{schedule_client_setup, AcceptDeps, AcceptLimits, AcceptPipeline},
+    accept::{allocate_unique_realm_id, schedule_client_setup, AcceptDeps, AcceptLimits, AcceptPipeline},
     config::{Config, DropPolicy},
     fdlog::log_fd_snapshot,
     metrics::{InMemoryMetrics, MetricsHandle},
@@ -27,6 +27,8 @@ use crate::{
     shutdown::ShutdownReason,
     transport::{handshake::p2p_handshake, ptcp::PTCPEvent},
 };
+
+const REALM_ID_ALLOCATION_MAX_ATTEMPTS: usize = 64;
 
 mod accept;
 mod buffer;
@@ -589,7 +591,18 @@ async fn run_server_once(
                 break;
             }
         };
-        let realm_id = rand::random::<u32>();
+        let Some(realm_id) = allocate_unique_realm_id(
+            &channels2,
+            &conn_channels2,
+            REALM_ID_ALLOCATION_MAX_ATTEMPTS,
+        ) else {
+            warn!(
+                "Dropping client {}: failed to allocate unique realm id after {} attempts",
+                addr, REALM_ID_ALLOCATION_MAX_ATTEMPTS
+            );
+            metrics.inc_counter("realm_id_allocation_failed");
+            continue;
+        };
         schedule_client_setup(client, addr, realm_id, &accept_pipeline);
     }
 

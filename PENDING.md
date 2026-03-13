@@ -170,7 +170,7 @@ Handshake and protocol parse paths still use panic-prone operations (`unwrap/ass
 
 ---
 
-## 7) Add realm ID collision protection (low-medium priority)
+## 7) Add realm ID collision protection (low-medium priority) - COMPLETED
 
 **Problem**  
 Realm IDs are random `u32` and inserted directly; collision can overwrite an existing realm mapping.
@@ -181,6 +181,12 @@ Realm IDs are random `u32` and inserted directly; collision can overwrite an exi
 
 **Success criteria**
 - No accidental channel replacement due to realm ID collision.
+
+**Completion notes (2026-03-13)**
+- Added bounded realm ID allocation in `src/accept.rs` via `allocate_unique_realm_id(...)`, and wired accept-loop usage in `src/main.rs` with explicit failure handling/metrics when allocation cannot find a free ID in the retry budget.
+- Added defensive collision guards in `handle_accepted_client(...)` so channel/waiter maps are never overwritten even if a colliding ID slips through allocation timing.
+- Added regression tests for retry-on-collision allocation and no-overwrite behavior when an accepted client arrives with an already-mapped realm ID.
+- Verified by running focused new tests, full `cargo test`, and `cargo build --release`.
 
 ---
 
@@ -246,7 +252,7 @@ When an item is fully completed (test-first reproduction, fix, and regression ch
 - [x] 4) Reduce jitter wraparound log noise and correct wrap accounting
 - [x] 5) Reclassify and enrich reset-by-peer logs
 - [x] 6) Harden handshake/parser path by removing panic/unwrap/assert on network data
-- [ ] 7) Add realm ID collision protection
+- [x] 7) Add realm ID collision protection
 - [ ] 8) Improve observability for real root-cause analysis
 - [ ] 9) Run controlled soak tests after each change
 

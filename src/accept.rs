@@ -80,6 +80,37 @@ impl AcceptPipeline {
     }
 }
 
+fn allocate_unique_realm_id_with<F>(
+    channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    conn_channels: &Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    max_attempts: usize,
+    mut next_id: F,
+) -> Option<u32>
+where
+    F: FnMut() -> u32,
+{
+    for _ in 0..max_attempts {
+        let candidate = next_id();
+        let chans = channels.lock().unwrap();
+        if chans.contains_key(&candidate) {
+            continue;
+        }
+        let conns = conn_channels.lock().unwrap();
+        if !conns.contains_key(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub(crate) fn allocate_unique_realm_id(
+    channels: &Arc<Mutex<HashMap<u32, ClientChannel>>>,
+    conn_channels: &Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    max_attempts: usize,
+) -> Option<u32> {
+    allocate_unique_realm_id_with(channels, conn_channels, max_attempts, rand::random::<u32>)
+}
+
 async fn handle_accepted_client(
     client: TcpStream,
     addr: SocketAddr,
@@ -99,12 +130,32 @@ async fn handle_accepted_client(
         addr, realm_id
     );
 
-    // Store the channel in the map before connect request.
-    deps.channels
-        .lock()
-        .unwrap()
-        .insert(realm_id, channel.clone());
-    deps.conn_channels.lock().unwrap().insert(realm_id, conn_tx);
+    // Guard against accidental realm reuse so existing mappings are never replaced.
+    {
+        let mut channels = deps.channels.lock().unwrap();
+        if channels.contains_key(&realm_id) {
+            warn!(
+                "Rejecting client {}: realm {:08x} already exists",
+                addr, realm_id
+            );
+            deps.metrics.inc_counter("realm_id_collision_rejected");
+            return;
+        }
+        channels.insert(realm_id, channel.clone());
+    }
+    {
+        let mut conn_channels = deps.conn_channels.lock().unwrap();
+        if conn_channels.contains_key(&realm_id) {
+            warn!(
+                "Rejecting client {}: realm {:08x} waiter already exists",
+                addr, realm_id
+            );
+            deps.channels.lock().unwrap().remove(&realm_id);
+            deps.metrics.inc_counter("realm_id_collision_rejected");
+            return;
+        }
+        conn_channels.insert(realm_id, conn_tx);
+    }
     {
         let chans = deps.channels.lock().unwrap();
         let conns = deps.conn_channels.lock().unwrap();
@@ -360,6 +411,80 @@ mod tests {
         assert!(
             evt2.is_err(),
             "second client should be rejected while pending limit is full"
+        );
+    }
+
+    #[test]
+    fn allocate_unique_realm_id_retries_until_unused() {
+        let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
+        channels
+            .lock()
+            .unwrap()
+            .insert(0xAAAA_AAAA, ClientChannel::new());
+
+        let mut ids = vec![0xAAAA_AAAA, 0xBBBB_BBBB].into_iter();
+        let allocated = allocate_unique_realm_id_with(&channels, &conn_channels, 4, || {
+            ids.next().expect("test id stream exhausted")
+        });
+
+        assert_eq!(allocated, Some(0xBBBB_BBBB));
+    }
+
+    #[tokio::test]
+    async fn handle_accepted_client_does_not_overwrite_existing_realm_mapping() {
+        let mut cfg = Config::default();
+        cfg.realm_ready_timeout_secs = 1;
+        let cfg = Arc::new(cfg);
+        let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+        let health = Arc::new(HealthCounters::default());
+        let reset_tracker = Arc::new(ResetBurstTracker::new(Duration::from_secs(60), 20));
+        let (dh_tx, mut dh_rx) = mpsc::channel::<PTCPEvent>(8);
+        let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownReason::Stop);
+
+        let existing_channel = ClientChannel::new();
+        channels
+            .lock()
+            .unwrap()
+            .insert(0xDEAD_BEEF, existing_channel.clone());
+        let (existing_conn_tx, mut existing_conn_rx) = oneshot::channel::<bool>();
+        conn_channels
+            .lock()
+            .unwrap()
+            .insert(0xDEAD_BEEF, existing_conn_tx);
+
+        let deps = AcceptDeps::new(
+            cfg,
+            metrics,
+            dh_tx,
+            health,
+            reset_tracker,
+            channels.clone(),
+            conn_channels.clone(),
+            shutdown_rx,
+        );
+        let (accepted, addr, client_side) = make_accepted_client().await;
+        let _hold_stream = client_side;
+
+        handle_accepted_client(accepted, addr, 0xDEAD_BEEF, deps).await;
+
+        let evt = tokio::time::timeout(Duration::from_millis(50), dh_rx.recv()).await;
+        assert!(
+            !matches!(evt, Ok(Some(PTCPEvent::Connect(_)))),
+            "no PTCP connect should be sent for colliding realm id"
+        );
+        assert_eq!(
+            channels.lock().unwrap().len(),
+            1,
+            "collision must not replace existing realm mapping"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut existing_conn_rx)
+                .await
+                .is_err(),
+            "existing realm waiter should still be intact after collision reject"
         );
     }
 }
