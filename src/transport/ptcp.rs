@@ -145,6 +145,37 @@ impl std::fmt::Debug for PTCPPacket {
 }
 
 impl PTCPBody {
+    fn parse_status_body(data: &[u8]) -> Option<(u32, String)> {
+        // Status frames are expected to use the fixed 12-byte header:
+        // 0x12 00 00 00 <realm:u32> 00 00 00 00 <ascii status>
+        if data.len() < 13 || data[1..4] != [0x00, 0x00, 0x00] || data[8..12] != [0, 0, 0, 0] {
+            return None;
+        }
+
+        let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
+        // Device statuses we've observed and act on are CONN and DISC*.
+        // Other 0x12-prefixed payloads should be treated as opaque commands.
+        let raw_status = data[12..]
+            .split(|b| *b == 0)
+            .next()
+            .unwrap_or(&[])
+            .to_vec();
+        if raw_status.is_empty() {
+            return None;
+        }
+        if !(raw_status.starts_with(b"CONN") || raw_status.starts_with(b"DISC")) {
+            return None;
+        }
+
+        let status = String::from_utf8_lossy(&raw_status).trim().to_string();
+        if status.is_empty() {
+            return None;
+        }
+
+        Some((realm, status))
+    }
+
     fn parse(data: &[u8]) -> Result<PTCPBody, PTCPReadError> {
         if data.len() == 0 {
             return Ok(PTCPBody::Empty);
@@ -179,9 +210,11 @@ impl PTCPBody {
                         data.len()
                     )));
                 }
-                let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                let status = String::from_utf8_lossy(&data[12..]).to_string();
-                Ok(PTCPBody::Status(realm, status))
+                if let Some((realm, status)) = Self::parse_status_body(data) {
+                    Ok(PTCPBody::Status(realm, status))
+                } else {
+                    Ok(PTCPBody::Command(data.to_vec()))
+                }
             }
             0x13 => Ok(PTCPBody::Heartbeat),
             _ => Ok(PTCPBody::Command(data.to_vec())),
@@ -676,6 +709,41 @@ mod tests {
             PTCPPacket::parse(&data),
             Err(PTCPReadError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn parse_status_accepts_conn_with_trailing_nul() {
+        let body = [
+            0x12, 0x00, 0x00, 0x00, // status tag
+            0x12, 0x34, 0x56, 0x78, // realm
+            0x00, 0x00, 0x00, 0x00, // reserved
+            b'C', b'O', b'N', b'N', 0x00,
+        ];
+
+        let parsed = PTCPBody::parse(&body).expect("status should parse");
+        match parsed {
+            PTCPBody::Status(realm, status) => {
+                assert_eq!(realm, 0x12345678);
+                assert_eq!(status, "CONN");
+            }
+            _ => panic!("expected status body"),
+        }
+    }
+
+    #[test]
+    fn parse_status_like_unknown_payload_falls_back_to_command() {
+        let body = [
+            0x12, 0x00, 0x0b, 0x34, // 0x12-prefixed payload that is not status
+            0x00, 0x00, 0x00, 0x00, // realm-like bytes
+            0x00, 0x00, 0x00, 0x00, // reserved-like bytes
+            b'+', b'8', b'K',
+        ];
+
+        let parsed = PTCPBody::parse(&body).expect("payload should parse");
+        match parsed {
+            PTCPBody::Command(data) => assert_eq!(data, body),
+            _ => panic!("expected command fallback"),
+        }
     }
 
     #[test]
