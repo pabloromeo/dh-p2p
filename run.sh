@@ -19,7 +19,7 @@ RUST_LOG="${RUST_LOG:-info}" ./target/release/dh-p2p \
     --enable-probe \
     --probe-port 8080 \
     --health-interval-secs 600 \
-    --heartbeat-interval-secs 2 \
-    --heartbeat-missed-limit 10 \
+    --heartbeat-interval-secs 10 \
+    --heartbeat-missed-limit 2 \
     --heartbeat-timeout-grace-secs 10 \
     -v

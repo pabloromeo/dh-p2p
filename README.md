@@ -56,9 +56,9 @@ Options:
   -H, --health-interval-secs <secs>
           Interval for periodic health logs (default: 60)
       --heartbeat-interval-secs <secs>
-          PTCP heartbeat send interval in seconds (default: 2)
+          PTCP heartbeat send interval in seconds (default: 10)
       --heartbeat-missed-limit <count>
-          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 10)
+          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 2)
       --heartbeat-timeout-grace-secs <secs>
           Extra grace period before restarting an inactive PTCP session (default: 10)
   -e, --enable-probe
@@ -87,7 +87,7 @@ The Rust proxy sends PTCP heartbeats every `--heartbeat-interval-secs` and resta
 heartbeat_interval_secs * heartbeat_missed_limit + heartbeat_timeout_grace_secs
 ```
 
-The default is `2 * 10 + 10 = 30` seconds. This avoids tearing down a live camera stream for short relay/network stalls while still recovering from genuinely stuck PTCP sessions. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
+The default is `10 * 2 + 10 = 30` seconds. The 10-second heartbeat cadence matches the native SDK's PTCP keepalive interval while preserving the same 30-second inactivity recovery window. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
 
 ### Jitter Buffer
 

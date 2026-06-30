@@ -123,14 +123,14 @@ struct Cli {
     #[arg(
         long = "heartbeat-interval-secs",
         value_name = "secs",
-        default_value = "2"
+        default_value = "10"
     )]
     heartbeat_interval_secs: u64,
     /// Consecutive heartbeat intervals without inbound PTCP activity before restart
     #[arg(
         long = "heartbeat-missed-limit",
         value_name = "count",
-        default_value = "10"
+        default_value = "2"
     )]
     heartbeat_missed_limit: u64,
     /// Extra grace period before restarting an inactive PTCP session

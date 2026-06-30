@@ -486,6 +486,21 @@ Runtime correction: one local tree still initialized relay-channel confirmation 
 
 Rejected hypothesis: using one connected UDP socket while switching between the main server and relay agent might drop cross-peer packets at the OS level. A local experiment disconnected the UDP socket after sending `/device/{serial}/relay-channel` and waited for the confirmation without peer filtering. Result: worse; relay-channel confirmation timed out completely. Reverted to the connected-agent receive path.
 
+### Native PTCP Keepalive Timing
+
+Confirmed from `CProxyChannelClient::sendKeepAlive`, `CProxyChannel::sendKeepAlive`, `CPtcpChannel::longTimeTaskDeal`, and `MM_NET_TOOL::TPTCPClient::Heartbeat`.
+
+The SDK has two relevant PTCP keepalive layers:
+
+- The proxy/channel layer sends a 12-byte `0x13` keepalive body.
+- The lower `TPTCPClient` engine stores a configurable keepalive packet via `SetKeepLifePacket(...)`; its constructor default interval is `10s`.
+
+The SDK PTCP timeout constants extracted from `.rodata` include `10,000ms` and `30,000ms`. `CPtcpChannel::longTimeTaskDeal` uses a `30,000ms` channel heartbeat timeout, which matches this project's existing default inactivity window. The mismatch was not the watchdog duration itself, but the heartbeat cadence: this project used `2s * 10 + 10s = 30s`, while the native engine uses a 10-second keepalive cadence with the same 30-second effective timeout.
+
+Implementation update: local defaults and `run.sh` now use `--heartbeat-interval-secs 10 --heartbeat-missed-limit 2 --heartbeat-timeout-grace-secs 10`, preserving the 30-second watchdog while matching the SDK's observed PTCP keepalive cadence.
+
+Open: no static `1800s` or `1,800,000ms` relay lifetime constant was found in the native library, and no obvious relay-renew endpoint was found beyond `/online/relay`, `/relay/agent`, `/relay/start`, relay-channel setup, and `/relay/unbind`. The 30-minute `ECONNREFUSED` issue may therefore be server-side relay allocation expiry or a subtler PTCP/accounting mismatch rather than a clearly named SDK renewal call.
+
 ## Current Implementation Deltas
 
 These are the main known differences between the SDK and `src/transport/handshake.rs`.
@@ -498,6 +513,7 @@ These are the main known differences between the SDK and `src/transport/handshak
 - Local experiment: remove request `PubAddr`; PCAPdroid captured `PubAddr` in the response but not the request.
 - Implemented: add `Nonce` and `CreateDate` for `/device/{serial}/relay-channel`.
 - Implemented: log sanitized outgoing body key names for relay setup requests, mirroring the existing response `body_keys` logging.
+- Implemented: match native PTCP keepalive cadence (`10s`) while preserving the existing 30-second inactivity timeout.
 
 ### Medium-Risk Candidates
 
