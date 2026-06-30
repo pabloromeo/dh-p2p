@@ -2,7 +2,12 @@ use async_trait::async_trait;
 use base64::Engine;
 use log::{debug, error, info, trace, warn};
 use sha1::Digest;
-use std::{collections::HashMap, io, net::SocketAddrV4, time::Instant};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io,
+    net::SocketAddrV4,
+    time::Instant,
+};
 use tokio::{net::UdpSocket, time};
 use xml::reader::{EventReader, XmlEvent};
 
@@ -78,6 +83,64 @@ fn peer_addr_display(socket: &UdpSocket) -> String {
         .unwrap_or_else(|_| "<unconnected>".to_string())
 }
 
+fn body_keys(res: &DHResponse) -> String {
+    let Some(body) = &res.body else {
+        return "<none>".to_string();
+    };
+
+    let mut keys = body.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.join(",")
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn xml_body(fields: &[(&str, String)]) -> String {
+    let mut sorted = BTreeMap::new();
+    for (key, value) in fields {
+        sorted.insert(*key, value.as_str());
+    }
+
+    let mut body = String::from("<body>");
+    for (key, value) in sorted {
+        body.push('<');
+        body.push_str(key);
+        body.push('>');
+        body.push_str(&xml_escape(value));
+        body.push_str("</");
+        body.push_str(key);
+        body.push('>');
+    }
+    body.push_str("</body>");
+    body
+}
+
+fn format_client_id(cid: &[u8; 8]) -> String {
+    cid.iter()
+        .map(|b| format!("{:x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn socket_addr_body_value(socket: &UdpSocket) -> io::Result<String> {
+    Ok(socket.local_addr()?.to_string())
+}
+
+fn relay_channel_nonce() -> String {
+    rand::random::<u32>().to_string()
+}
+
+fn relay_channel_create_date() -> String {
+    chrono::Utc::now().timestamp().to_string()
+}
+
 fn trace_peer(prefix: &str, socket: &UdpSocket) {
     trace!("{} {}", prefix, peer_addr_display(socket));
 }
@@ -113,7 +176,10 @@ fn split_response_sections(res: &str) -> Option<(&str, &str)> {
         .or_else(|| res.split_once("\n\n"))
 }
 
-async fn read_non_empty_packet(socket: &UdpSocket, session: &mut PTCPSession) -> io::Result<PTCPPacket> {
+async fn read_non_empty_packet(
+    socket: &UdpSocket,
+    session: &mut PTCPSession,
+) -> io::Result<PTCPPacket> {
     let mut res = session.recv(socket.ptcp_read().await?);
     while let PTCPBody::Empty = res.body {
         res = session.recv(socket.ptcp_read().await?);
@@ -134,10 +200,26 @@ async fn discover_bootstrap(
         .await?;
     let p2psrv_res = socket.dh_read().await?;
     let p2psrv = response_body_field(&p2psrv_res, "body/US")?.to_string();
+    info!(
+        "P2P bootstrap resolved server for serial {}: p2psrv={} (code={}, status={}, body_keys={})",
+        serial,
+        p2psrv,
+        p2psrv_res.code,
+        p2psrv_res.status,
+        body_keys(&p2psrv_res)
+    );
 
     socket.dh_request("/online/relay", None, cseq).await?;
     let relay_res = socket.dh_read().await?;
     let relay = response_body_field(&relay_res, "body/Address")?.to_string();
+    info!(
+        "P2P bootstrap resolved relay for serial {}: relay={} (code={}, status={}, body_keys={})",
+        serial,
+        relay,
+        relay_res.code,
+        relay_res.status,
+        body_keys(&relay_res)
+    );
 
     Ok((p2psrv, relay))
 }
@@ -156,14 +238,22 @@ async fn request_p2p_channel(
     cid: &[u8; 8],
     cseq: &mut u32,
 ) -> io::Result<()> {
+    let local_addr = socket_addr_body_value(socket)?;
+    let body = xml_body(&[
+        ("Identify", format_client_id(cid)),
+        ("IpEncrpt", "true".to_string()),
+        (
+            "LocalAddr",
+            format!("127.0.0.1:{}", socket.local_addr()?.port()),
+        ),
+        ("PubAddr", local_addr),
+        ("version", "5.0.0".to_string()),
+    ]);
+    debug!("P2P channel request body_keys=Identify,IpEncrpt,LocalAddr,PubAddr,version");
     socket
         .dh_request(
             format!("/device/{}/p2p-channel", serial).as_ref(),
-            Some(format!(
-                "<body><Identify>{}</Identify><IpEncrpt>true</IpEncrpt><LocalAddr>127.0.0.1:{}</LocalAddr><version>5.0.0</version></body>",
-                cid.iter().map(|b| format!("{:x}", b)).collect::<Vec<_>>().join(" "),
-                socket.local_addr()?.port(),
-            ).as_ref()),
+            Some(body.as_ref()),
             cseq,
         )
         .await
@@ -172,27 +262,60 @@ async fn request_p2p_channel(
 async fn setup_relay_agent(
     socket2: &UdpSocket,
     relay: &str,
+    serial: &str,
     cseq: &mut u32,
 ) -> io::Result<(String, String)> {
     socket2.connect(relay).await?;
     debug!("Requesting relay agent...");
-    socket2.dh_request("/relay/agent", None, cseq).await?;
+    let agent_body = xml_body(&[("Dev", serial.to_string())]);
+    debug!("Relay agent request body_keys=Dev");
+    socket2
+        .dh_request("/relay/agent", Some(agent_body.as_ref()), cseq)
+        .await?;
     let data = socket2.dh_read().await?;
     let token = response_body_field(&data, "body/Token")?.to_string();
     let agent = response_body_field(&data, "body/Agent")?.to_string();
-    debug!("Got agent: {}", agent);
+    info!(
+        "Relay agent allocated: relay={}, agent={}, token_len={}, code={}, status={}, body_keys={}",
+        relay,
+        agent,
+        token.len(),
+        data.code,
+        data.status,
+        body_keys(&data)
+    );
 
     socket2.connect(&agent).await?;
-    debug!("Starting relay...");
+    debug!(
+        "Starting relay via agent {} (token_len={}, local_addr={})",
+        agent,
+        token.len(),
+        socket2
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string())
+    );
+    let start_body = xml_body(&[
+        ("Client", socket_addr_body_value(socket2)?),
+        ("Dev", serial.to_string()),
+    ]);
+    debug!("Relay start request body_keys=Client,Dev");
     socket2
         .dh_request(
             format!("/relay/start/{}", token).as_ref(),
-            Some("<body><Client>:0</Client></body>"),
+            Some(start_body.as_ref()),
             cseq,
         )
         .await?;
-    socket2.dh_read().await?;
-    debug!("Relay started");
+    let start_res = socket2.dh_read().await?;
+    info!(
+        "Relay started: agent={}, token_len={}, code={}, status={}, body_keys={}",
+        agent,
+        token.len(),
+        start_res.code,
+        start_res.status,
+        body_keys(&start_res)
+    );
     Ok((token, agent))
 }
 
@@ -230,20 +353,38 @@ async fn establish_relay_channel(
         );
 
         socket2.connect(MAIN_SERVER).await?;
+        let relay_channel_body = xml_body(&[
+            ("CreateDate", relay_channel_create_date()),
+            ("Nonce", relay_channel_nonce()),
+            ("agentAddr", agent.to_string()),
+        ]);
+        debug!("Relay channel request body_keys=CreateDate,Nonce,agentAddr");
         socket2
             .dh_request(
                 format!("/device/{}/relay-channel", serial).as_ref(),
-                Some(format!("<body><agentAddr>{}</agentAddr></body>", agent).as_ref()),
+                Some(relay_channel_body.as_ref()),
                 cseq,
             )
             .await?;
 
         socket2.connect(agent).await?;
-        debug!("Waiting for relay channel confirmation...");
+        debug!(
+            "Waiting for relay channel confirmation from agent {} (attempt {}/{})",
+            agent, attempt, max_retries
+        );
 
         match time::timeout(time::Duration::from_millis(500), socket2.dh_read()).await {
-            Ok(Ok(_)) => {
-                debug!("Relay channel ready");
+            Ok(Ok(res)) => {
+                info!(
+                    "Relay channel ready for serial {} via agent {} (attempt {}/{}, code={}, status={}, body_keys={})",
+                    serial,
+                    agent,
+                    attempt,
+                    max_retries,
+                    res.code,
+                    res.status,
+                    body_keys(&res)
+                );
                 return Ok(());
             }
             Ok(Err(e)) => {
@@ -280,7 +421,12 @@ async fn release_relay_session(token: &str, agent: &str) -> io::Result<()> {
     let mut cseq = 0;
     time::timeout(RELAY_STOP_TIMEOUT, socket.connect(agent))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out connecting to relay agent"))??;
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out connecting to relay agent",
+            )
+        })??;
     time::timeout(
         RELAY_STOP_TIMEOUT,
         socket.dh_request(format!("/relay/stop/{}", token).as_ref(), None, &mut cseq),
@@ -292,7 +438,10 @@ async fn release_relay_session(token: &str, agent: &str) -> io::Result<()> {
     match time::timeout(RELAY_STOP_TIMEOUT, socket.dh_read()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            warn!("relay stop returned error response, continuing anyway: {}", e);
+            warn!(
+                "relay stop returned error response, continuing anyway: {}",
+                e
+            );
         }
         Err(_) => {
             debug!("relay stop returned no response before timeout; continuing");
@@ -301,7 +450,10 @@ async fn release_relay_session(token: &str, agent: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn negotiate_relay_sign(socket2: &UdpSocket, session: &mut PTCPSession) -> io::Result<Vec<u8>> {
+async fn negotiate_relay_sign(
+    socket2: &UdpSocket,
+    session: &mut PTCPSession,
+) -> io::Result<Vec<u8>> {
     socket2
         .ptcp_request(session.send(PTCPBody::Command(
             b"\x17\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
@@ -427,13 +579,15 @@ async fn perform_direct_handshake(
     }
 
     socket
-        .ptcp_request(session.send(PTCPBody::Command(
-            [
-                b"\x19\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
-                sign.to_vec(),
-            ]
-            .concat(),
-        )))
+        .ptcp_request(
+            session.send(PTCPBody::Command(
+                [
+                    b"\x19\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+                    sign.to_vec(),
+                ]
+                .concat(),
+            )),
+        )
         .await?;
 
     res = read_non_empty_packet(socket, &mut session).await?;
@@ -483,7 +637,7 @@ pub async fn p2p_handshake(
     request_p2p_channel(&socket, &serial, &cid, &mut cseq).await?;
 
     info!("Setting up relay connection...");
-    let (token, agent) = setup_relay_agent(&socket2, &relay, &mut cseq).await?;
+    let (token, agent) = setup_relay_agent(&socket2, &relay, &serial, &mut cseq).await?;
     let relay_lease = Some(RelayLease {
         token,
         agent: agent.clone(),
@@ -503,9 +657,7 @@ pub async fn p2p_handshake(
     );
     let mut session = PTCPSession::new();
 
-    socket2
-        .ptcp_request(session.send(PTCPBody::Sync))
-        .await?;
+    socket2.ptcp_request(session.send(PTCPBody::Sync)).await?;
     session.recv(socket2.ptcp_read().await?);
 
     if relay_mode {
@@ -691,7 +843,12 @@ impl DHP2P for UdpSocket {
         trace!("---");
 
         let res = DHResponse::parse_response(&res)?;
-        debug!("<<< {} {} {}", peer_addr_display(self), res.code, res.status);
+        debug!(
+            "<<< {} {} {}",
+            peer_addr_display(self),
+            res.code,
+            res.status
+        );
 
         Ok(res)
     }
@@ -699,7 +856,7 @@ impl DHP2P for UdpSocket {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_tail, parse_header_line, DHResponse};
+    use super::{command_tail, format_client_id, parse_header_line, xml_body, DHResponse};
     use crate::transport::ptcp::PTCPBody;
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use std::panic;
@@ -727,7 +884,10 @@ mod tests {
         let raw = "HTTP/1.1 200 OK\r\nCSeq:1\r\nServer:device\r\n\r\n";
         let res = DHResponse::parse_response(raw).expect("response should parse");
         assert_eq!(res.headers.get("CSeq").map(String::as_str), Some("1"));
-        assert_eq!(res.headers.get("Server").map(String::as_str), Some("device"));
+        assert_eq!(
+            res.headers.get("Server").map(String::as_str),
+            Some("device")
+        );
     }
 
     #[test]
@@ -754,6 +914,26 @@ mod tests {
     }
 
     #[test]
+    fn xml_body_sorts_fields_and_escapes_values() {
+        let body = xml_body(&[
+            ("Dev", "CAM&1".to_string()),
+            ("Client", "192.0.2.10:1234".to_string()),
+            ("Note", "<quoted>\"value\"".to_string()),
+        ]);
+
+        assert_eq!(
+            body,
+            "<body><Client>192.0.2.10:1234</Client><Dev>CAM&amp;1</Dev><Note>&lt;quoted&gt;&quot;value&quot;</Note></body>"
+        );
+    }
+
+    #[test]
+    fn format_client_id_matches_sdk_style_hex_bytes() {
+        let cid = [0x00, 0x01, 0x0a, 0x10, 0xab, 0xcd, 0xef, 0xff];
+        assert_eq!(format_client_id(&cid), "0 1 a 10 ab cd ef ff");
+    }
+
+    #[test]
     fn command_tail_rejects_short_command_payload() {
         let body = PTCPBody::Command(vec![0x10, 0x20]);
         assert!(command_tail(&body, 12, "relay sign").is_err());
@@ -770,7 +950,10 @@ mod tests {
         let raw = "HTTP/1.1 200 OK\nCSeq:1\nServer:device\n\n";
         let res = DHResponse::parse_response(raw).expect("lf-only response should parse");
         assert_eq!(res.headers.get("CSeq").map(String::as_str), Some("1"));
-        assert_eq!(res.headers.get("Server").map(String::as_str), Some("device"));
+        assert_eq!(
+            res.headers.get("Server").map(String::as_str),
+            Some("device")
+        );
     }
 
     #[test]

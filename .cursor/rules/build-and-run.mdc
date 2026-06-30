@@ -1,0 +1,20 @@
+---
+description: Build and run dh-p2p with the binary path used by run.sh
+alwaysApply: true
+---
+
+# Build And Run
+
+- `run.sh` executes `./target/release/dh-p2p`.
+- Before asking the user to test `run.sh`, build with:
+
+```bash
+CARGO_TARGET_DIR=target cargo build --release
+```
+
+- Do not rely on plain `cargo build --release` if the shell may have a persisted or inherited `CARGO_TARGET_DIR`; it can build into another directory while `./target/release/dh-p2p` remains stale.
+- After changing CLI flags or startup behavior, optionally verify the right binary with:
+
+```bash
+./target/release/dh-p2p --help
+```

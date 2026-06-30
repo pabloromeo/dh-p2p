@@ -156,11 +156,7 @@ impl PTCPBody {
 
         // Device statuses we've observed and act on are CONN and DISC*.
         // Other 0x12-prefixed payloads should be treated as opaque commands.
-        let raw_status = data[12..]
-            .split(|b| *b == 0)
-            .next()
-            .unwrap_or(&[])
-            .to_vec();
+        let raw_status = data[12..].split(|b| *b == 0).next().unwrap_or(&[]).to_vec();
         if raw_status.is_empty() {
             return None;
         }
@@ -418,8 +414,11 @@ impl PTCPReadError {
                 // These errors indicate the connection is dead or unusable
                 // Note: TimedOut is NOT fatal - it just means no data arrived in the timeout
                 // period. The watchdog will handle genuine connection death.
-                e.kind() == io::ErrorKind::ConnectionRefused
-                    || e.kind() == io::ErrorKind::ConnectionReset
+                //
+                // UDP ECONNREFUSED usually means an ICMP error was reported for a prior send.
+                // The Dahua SDK appears to tolerate those transient reports and let channel
+                // inactivity decide whether the session is actually dead.
+                e.kind() == io::ErrorKind::ConnectionReset
                     || e.kind() == io::ErrorKind::NotConnected
             }
             // Malformed packets are not fatal - could be transient network corruption
@@ -449,10 +448,7 @@ impl PTCP for UdpSocket {
         trace!("---");
 
         let packet = packet.serialize();
-        self.send(&packet).await.map(|_| ()).map_err(|e| {
-            log::error!("PTCP send error: {}", e);
-            e
-        })
+        self.send(&packet).await.map(|_| ())
     }
 
     async fn ptcp_read(&self) -> Result<PTCPPacket, PTCPReadError> {

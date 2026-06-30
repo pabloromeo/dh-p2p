@@ -24,6 +24,16 @@ In my specific scenario, I have a KBVision CCTV system. Although I can access th
 
 Rust implementation utilizing async programming and message passing pattern, making it more efficient and flexible.
 
+### Building and running locally
+
+See `BUILDING.md` for the canonical local workflow. In particular, build release binaries with:
+
+```bash
+CARGO_TARGET_DIR=target cargo build --release
+```
+
+`run.sh` executes `./target/release/dh-p2p`, so using an alternate Cargo target directory can leave `run.sh` running a stale binary.
+
 ### Rust usage
 
 ```text

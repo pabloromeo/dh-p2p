@@ -71,6 +71,17 @@ fn log_fd_state(
     log_fd_snapshot(label, chan_len, conn_len);
 }
 
+fn log_ptcp_send_error(context: &str, error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        warn!(
+            "{} returned ECONNREFUSED; keeping PTCP session alive and letting inactivity watchdog decide (err={})",
+            context, error
+        );
+    } else {
+        log::error!("{} failed: {}", context, error);
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientChannel {
     buffer: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
@@ -480,7 +491,7 @@ pub async fn dh_writer(
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
     mut shutdown: watch::Receiver<ShutdownReason>,
-    shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
+    _shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
     channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     health: Arc<HealthCounters>,
@@ -497,11 +508,7 @@ pub async fn dh_writer(
             PTCPEvent::Heartbeat => {
                 let p = session.lock().unwrap().send(PTCPBody::Heartbeat);
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!("PTCP heartbeat send error: {}", e);
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(ShutdownReason::Restart);
-                        break;
-                    }
+                    log_ptcp_send_error("PTCP heartbeat send", &e);
                 }
             }
             PTCPEvent::Connect(realm) => {
@@ -514,11 +521,7 @@ pub async fn dh_writer(
                     realm, remote_port
                 );
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!("PTCP bind send error for realm {:08x}: {}", realm, e);
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(ShutdownReason::Restart);
-                        break;
-                    }
+                    log_ptcp_send_error(&format!("PTCP bind send for realm {:08x}", realm), &e);
                 }
             }
             PTCPEvent::Disconnect(realm) => {
@@ -527,11 +530,10 @@ pub async fn dh_writer(
                     .unwrap()
                     .send(PTCPBody::Status(realm, "DISC".to_string()));
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!("PTCP disconnect send error for realm {:08x}: {}", realm, e);
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(ShutdownReason::Restart);
-                        break;
-                    }
+                    log_ptcp_send_error(
+                        &format!("PTCP disconnect send for realm {:08x}", realm),
+                        &e,
+                    );
                 }
                 // Close the channel BEFORE removing from map to prevent race condition
                 // where dh_reader continues pushing to a channel that's being removed
@@ -560,11 +562,7 @@ pub async fn dh_writer(
                     .unwrap()
                     .send(PTCPBody::Payload(PTCPPayload { realm, data }));
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!("PTCP payload send error for realm {:08x}: {}", realm, e);
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(ShutdownReason::Restart);
-                        break;
-                    }
+                    log_ptcp_send_error(&format!("PTCP payload send for realm {:08x}", realm), &e);
                 }
             }
         }
@@ -786,11 +784,7 @@ pub async fn dh_reader(
                 // Send ACK
                 let p = session.lock().unwrap().send(PTCPBody::Empty);
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log::error!("PTCP ack send error: {}", e);
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                        let _ = shutdown_tx.send(ShutdownReason::Restart);
-                        break;
-                    }
+                    log_ptcp_send_error("PTCP ack send", &e);
                 }
 
                 match packet.body {
