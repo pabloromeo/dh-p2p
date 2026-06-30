@@ -28,12 +28,20 @@ pub struct Config {
     pub jitter_buffer_ms: u64,
 }
 
+impl Config {
+    pub fn ptcp_inactivity_timeout_secs(&self) -> u64 {
+        self.heartbeat_interval_secs
+            .saturating_mul(self.heartbeat_missed_limit)
+            .saturating_add(self.heartbeat_timeout_grace_secs)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             heartbeat_interval_secs: 2,
-            heartbeat_missed_limit: 2,
-            heartbeat_timeout_grace_secs: 2,
+            heartbeat_missed_limit: 10,
+            heartbeat_timeout_grace_secs: 10,
             health_interval_secs: 60,
             enable_probe: false,
             probe_port: 8080,
@@ -53,12 +61,20 @@ impl Default for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::DropPolicy;
+    use super::{Config, DropPolicy};
 
     #[test]
     fn drop_policy_variants_exist() {
         let _a = DropPolicy::Block;
         let _b = DropPolicy::DropNewest;
         let _c = DropPolicy::DropOldestKeepLatest;
+    }
+
+    #[test]
+    fn default_ptcp_inactivity_timeout_is_less_eager_than_heartbeat_interval() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.heartbeat_interval_secs, 2);
+        assert_eq!(cfg.ptcp_inactivity_timeout_secs(), 30);
     }
 }

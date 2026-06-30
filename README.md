@@ -45,6 +45,12 @@ Options:
           Drop policy for slow clients: block|drop_newest|keep_latest (default: block)
   -H, --health-interval-secs <secs>
           Interval for periodic health logs (default: 60)
+      --heartbeat-interval-secs <secs>
+          PTCP heartbeat send interval in seconds (default: 2)
+      --heartbeat-missed-limit <count>
+          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 10)
+      --heartbeat-timeout-grace-secs <secs>
+          Extra grace period before restarting an inactive PTCP session (default: 10)
   -e, --enable-probe
           Enable HTTP probe server for liveness/readiness (/livez, /readyz)
   -P, --probe-port <port>
@@ -53,6 +59,7 @@ Options:
           Increase verbosity (-v for debug, -vv for trace)
   -h, --help
           Print help
+```
 
 ### HTTP probes
 
@@ -61,7 +68,16 @@ When `--enable-probe` is set, an internal HTTP server exposes:
 - `/readyz`: 200 OK only after PTCP handshake succeeds and heartbeat/activity is healthy; otherwise 503.
 
 Configure probe port with `--probe-port` (default 8080). Intended for Kubernetes liveness/readiness probes.
+
+### PTCP heartbeat and inactivity watchdog
+
+The Rust proxy sends PTCP heartbeats every `--heartbeat-interval-secs` and restarts the PTCP session if no inbound PTCP activity is observed for:
+
+```text
+heartbeat_interval_secs * heartbeat_missed_limit + heartbeat_timeout_grace_secs
 ```
+
+The default is `2 * 10 + 10 = 30` seconds. This avoids tearing down a live camera stream for short relay/network stalls while still recovering from genuinely stuck PTCP sessions. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
 
 ### Jitter Buffer
 

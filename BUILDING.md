@@ -35,13 +35,20 @@ If `CARGO_TARGET_DIR` points somewhere else (for example, a temporary cache dire
 ## Recommended Local Workflow
 
 ```bash
-# 1) Build
+# 1) Create your local secret config once
+cp .env.example .env
+$EDITOR .env
+
+# 2) Build
 CARGO_TARGET_DIR=target cargo build --release
 
-# 2) Optional quick check
+# 3) Optional quick check
 ./target/release/dh-p2p --help
 
-# 3) Run with project defaults
+# 4) Run with project defaults
 ./run.sh
 ```
+
+`run.sh` is safe to commit because it reads the camera serial from `.env`.
+The `.env` file is ignored by Git so local device secrets stay on your machine.
 

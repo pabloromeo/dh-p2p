@@ -1,6 +1,6 @@
 // Moved from ptcp.rs
 use async_trait::async_trait;
-use log::{debug, trace};
+use log::trace;
 use std::cmp;
 use std::io;
 use std::time::Duration;
@@ -440,9 +440,9 @@ pub trait PTCP {
 impl PTCP for UdpSocket {
     async fn ptcp_request(&self, packet: PTCPPacket) -> io::Result<()> {
         if let Ok(peer) = self.peer_addr() {
-            debug!(">>> {} {:?}", peer, packet.body);
+            trace!(">>> {} {:?}", peer, packet.body);
         } else {
-            debug!(">>> <unconnected> {:?}", packet.body);
+            trace!(">>> <unconnected> {:?}", packet.body);
         }
         trace!("{:?}", packet);
         packet.try_print_data();
@@ -502,9 +502,9 @@ impl PTCP for UdpSocket {
 
         let packet = PTCPPacket::parse(&buf[0..n])?;
         if let Ok(peer) = self.peer_addr() {
-            debug!("<<< {} {:?}", peer, packet.body);
+            trace!("<<< {} {:?}", peer, packet.body);
         } else {
-            debug!("<<< <unconnected> {:?}", packet.body);
+            trace!("<<< <unconnected> {:?}", packet.body);
         }
         trace!("{:?}", packet);
         packet.try_print_data();

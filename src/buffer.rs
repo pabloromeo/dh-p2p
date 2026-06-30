@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, info, trace, warn};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -106,7 +106,7 @@ impl JitterBuffer {
         }
 
         self.base_seq = Some(new_base);
-        debug!(
+        trace!(
             "JitterBuffer: rebased from {} to {} ({} packets)",
             old_base,
             new_base,

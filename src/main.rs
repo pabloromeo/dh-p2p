@@ -19,7 +19,9 @@ use tokio::{
 };
 
 use crate::{
-    accept::{allocate_unique_realm_id, schedule_client_setup, AcceptDeps, AcceptLimits, AcceptPipeline},
+    accept::{
+        allocate_unique_realm_id, schedule_client_setup, AcceptDeps, AcceptLimits, AcceptPipeline,
+    },
     config::{Config, DropPolicy},
     fdlog::log_fd_snapshot,
     metrics::{InMemoryMetrics, MetricsHandle},
@@ -92,6 +94,27 @@ struct Cli {
         default_value = "60"
     )]
     health_interval_secs: u64,
+    /// PTCP heartbeat send interval in seconds
+    #[arg(
+        long = "heartbeat-interval-secs",
+        value_name = "secs",
+        default_value = "2"
+    )]
+    heartbeat_interval_secs: u64,
+    /// Consecutive heartbeat intervals without inbound PTCP activity before restart
+    #[arg(
+        long = "heartbeat-missed-limit",
+        value_name = "count",
+        default_value = "10"
+    )]
+    heartbeat_missed_limit: u64,
+    /// Extra grace period before restarting an inactive PTCP session
+    #[arg(
+        long = "heartbeat-timeout-grace-secs",
+        value_name = "secs",
+        default_value = "10"
+    )]
+    heartbeat_timeout_grace_secs: u64,
     /// Enable HTTP probe server (/livez, /readyz)
     #[arg(short = 'e', long = "enable-probe", default_value_t = false)]
     enable_probe: bool,
@@ -147,6 +170,9 @@ async fn main() {
     let mut config = Config::default();
     config.jitter_buffer_ms = args.buffer_ms;
     config.health_interval_secs = args.health_interval_secs;
+    config.heartbeat_interval_secs = args.heartbeat_interval_secs.max(1);
+    config.heartbeat_missed_limit = args.heartbeat_missed_limit.max(1);
+    config.heartbeat_timeout_grace_secs = args.heartbeat_timeout_grace_secs;
     config.enable_probe = args.enable_probe;
     config.probe_port = args.probe_port;
     config.max_pending_realm_setups = args.max_pending_realm_setups.max(1);
@@ -422,10 +448,7 @@ async fn run_server_once(
             tokio::select! {
                 _ = interval.tick() => {
                     let last = *last_activity_watchdog.lock().unwrap();
-                    let timeout = Duration::from_secs(
-                        watchdog_config.heartbeat_interval_secs * watchdog_config.heartbeat_missed_limit
-                            + watchdog_config.heartbeat_timeout_grace_secs,
-                    );
+                    let timeout = Duration::from_secs(watchdog_config.ptcp_inactivity_timeout_secs());
                     if last.elapsed() >= timeout {
                         warn!("No PTCP activity for {:?}, requesting restart", timeout);
                         if let Some(flag) = &heartbeat_flag {
@@ -558,6 +581,7 @@ async fn run_server_once(
             }
         );
     }
+    info!("dh-p2p is ready to receive client connections");
 
     let mut shutdown_accept = shutdown_rx.clone();
     let accept_pipeline = AcceptPipeline::new(
