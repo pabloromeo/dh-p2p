@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use log::trace;
 use std::cmp;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
 pub enum PTCPEvent {
@@ -316,7 +316,7 @@ pub struct PTCPSession {
     sent: u32,
     recv: u32,
     count: u32,
-    id: u32,
+    started_at: Instant,
     rmid: u32,
 }
 
@@ -326,9 +326,13 @@ impl PTCPSession {
             sent: 0,
             recv: 0,
             count: 0,
-            id: 0,
+            started_at: Instant::now(),
             rmid: 0,
         }
+    }
+
+    fn lmid(&self) -> u32 {
+        (self.started_at.elapsed().as_millis() & u32::MAX as u128) as u32
     }
 
     pub fn send(&mut self, body: PTCPBody) -> PTCPPacket {
@@ -340,12 +344,11 @@ impl PTCPSession {
             PTCPBody::Sync => 0x0002FFFF,
             _ => 0x0000FFFF - (self.count & 0xFFFF),
         };
-        let lmid = self.id;
+        let lmid = self.lmid();
         let rmid = self.rmid;
 
         self.sent += body.len() as u32;
 
-        self.id += 1;
         self.count += match body {
             PTCPBody::Sync => 0,
             PTCPBody::Empty => 0,
@@ -609,6 +612,23 @@ mod tests {
         let packet = session.send(PTCPBody::Heartbeat);
         assert_eq!(packet.sent, 12); // Second packet starts at 12
         assert_eq!(session.sent, 24); // After sending, sent = 24
+    }
+
+    #[test]
+    fn test_lmid_uses_elapsed_milliseconds() {
+        let mut session = PTCPSession::new();
+        session.started_at = Instant::now() - Duration::from_millis(1234);
+
+        let packet = session.send(PTCPBody::Heartbeat);
+
+        assert!(
+            packet.lmid >= 1234,
+            "lmid should be based on session elapsed milliseconds"
+        );
+        assert!(
+            packet.lmid < 2000,
+            "lmid should not be the old packet counter"
+        );
     }
 
     #[test]

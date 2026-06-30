@@ -501,6 +501,14 @@ Implementation update: local defaults and `run.sh` now use `--heartbeat-interval
 
 Open: no static `1800s` or `1,800,000ms` relay lifetime constant was found in the native library, and no obvious relay-renew endpoint was found beyond `/online/relay`, `/relay/agent`, `/relay/start`, relay-channel setup, and `/relay/unbind`. The 30-minute `ECONNREFUSED` issue may therefore be server-side relay allocation expiry or a subtler PTCP/accounting mismatch rather than a clearly named SDK renewal call.
 
+### Native PTCP Sequence and Timestamp Fields
+
+Confirmed from `CPhonyTcp::packet`, `CPhonyTcp::parse`, `CPhonyTcp::processReceiver`, and `CPhonyTcp::processSender`.
+
+The SDK's PTCP-like segment logic maintains separate send and receive cursors. On inbound data, `processReceiver` advances its receive cursor from the peer's segment sequence plus payload length, then sends an ACK-only packet using that updated cursor. This matches the Rust implementation's existing behavior in `PTCPSession::recv`, where `recv` is derived from the peer's `sent + body.len()` rather than independently counted from local socket reads.
+
+The SDK also has a pair of timestamp/echo fields used for RTT/accounting. `CPhonyTcp::packet` writes a current monotonic timestamp into the outgoing segment and writes a stored peer timestamp into the paired field. `processSender` updates that stored peer timestamp from inbound packets. The Rust implementation already echoed the peer field back as `rmid`, but previously generated `lmid` as a simple packet counter. Local experiment: `lmid` now uses session-elapsed milliseconds while preserving `rmid = peer.lmid`.
+
 ## Current Implementation Deltas
 
 These are the main known differences between the SDK and `src/transport/handshake.rs`.
@@ -514,6 +522,7 @@ These are the main known differences between the SDK and `src/transport/handshak
 - Implemented: add `Nonce` and `CreateDate` for `/device/{serial}/relay-channel`.
 - Implemented: log sanitized outgoing body key names for relay setup requests, mirroring the existing response `body_keys` logging.
 - Implemented: match native PTCP keepalive cadence (`10s`) while preserving the existing 30-second inactivity timeout.
+- Implemented experimentally: generate PTCP `lmid` as an elapsed-millisecond timestamp instead of a packet counter, matching the SDK's timestamp/echo-field shape more closely.
 
 ### Medium-Risk Candidates
 
