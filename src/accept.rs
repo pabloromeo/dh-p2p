@@ -188,8 +188,7 @@ async fn handle_accepted_client(
                     addr
                 );
                 deps.metrics.inc_counter("realm_ready_failed");
-                deps.channels.lock().unwrap().remove(&realm_id);
-                deps.conn_channels.lock().unwrap().remove(&realm_id);
+                cleanup_pending_realm_setup(&deps, realm_id).await;
                 return;
             }
             info!(
@@ -209,8 +208,7 @@ async fn handle_accepted_client(
                 client_connected_at.elapsed().as_millis()
             );
             deps.metrics.inc_counter("realm_ready_timeout");
-            deps.channels.lock().unwrap().remove(&realm_id);
-            deps.conn_channels.lock().unwrap().remove(&realm_id);
+            cleanup_pending_realm_setup(&deps, realm_id).await;
             return;
         }
     }
@@ -259,6 +257,22 @@ async fn handle_accepted_client(
             .await;
         }
     });
+}
+
+async fn cleanup_pending_realm_setup(deps: &AcceptDeps, realm_id: u32) {
+    if deps
+        .dh_tx
+        .send(PTCPEvent::Disconnect(realm_id))
+        .await
+        .is_err()
+    {
+        warn!(
+            "Failed to enqueue disconnect for pending realm {:08x}",
+            realm_id
+        );
+    }
+    deps.channels.lock().unwrap().remove(&realm_id);
+    deps.conn_channels.lock().unwrap().remove(&realm_id);
 }
 
 pub(crate) fn schedule_client_setup(
@@ -485,6 +499,98 @@ mod tests {
                 .await
                 .is_err(),
             "existing realm waiter should still be intact after collision reject"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_accepted_client_disconnects_realm_after_ready_timeout() {
+        let mut cfg = Config::default();
+        cfg.realm_ready_timeout_secs = 0;
+        let cfg = Arc::new(cfg);
+        let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+        let health = Arc::new(HealthCounters::default());
+        let reset_tracker = Arc::new(ResetBurstTracker::new(Duration::from_secs(60), 20));
+        let (dh_tx, mut dh_rx) = mpsc::channel::<PTCPEvent>(8);
+        let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownReason::Stop);
+        let deps = AcceptDeps::new(
+            cfg,
+            metrics,
+            dh_tx,
+            health,
+            reset_tracker,
+            channels.clone(),
+            conn_channels.clone(),
+            shutdown_rx,
+        );
+        let (accepted, addr, client_side) = make_accepted_client().await;
+        let _hold_stream = client_side;
+
+        handle_accepted_client(accepted, addr, 0xCAFE_BABE, deps).await;
+
+        assert!(matches!(
+            dh_rx.recv().await,
+            Some(PTCPEvent::Connect(0xCAFE_BABE))
+        ));
+        assert!(matches!(
+            dh_rx.recv().await,
+            Some(PTCPEvent::Disconnect(0xCAFE_BABE))
+        ));
+        assert!(
+            channels.lock().unwrap().is_empty(),
+            "timed-out realm channel should be removed"
+        );
+        assert!(
+            conn_channels.lock().unwrap().is_empty(),
+            "timed-out realm waiter should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_accepted_client_disconnects_realm_after_ready_waiter_drops() {
+        let mut cfg = Config::default();
+        cfg.realm_ready_timeout_secs = 1;
+        let cfg = Arc::new(cfg);
+        let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+        let health = Arc::new(HealthCounters::default());
+        let reset_tracker = Arc::new(ResetBurstTracker::new(Duration::from_secs(60), 20));
+        let (dh_tx, mut dh_rx) = mpsc::channel::<PTCPEvent>(8);
+        let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
+        let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownReason::Stop);
+        let deps = AcceptDeps::new(
+            cfg,
+            metrics,
+            dh_tx,
+            health,
+            reset_tracker,
+            channels.clone(),
+            conn_channels.clone(),
+            shutdown_rx,
+        );
+        let (accepted, addr, client_side) = make_accepted_client().await;
+        let _hold_stream = client_side;
+
+        let setup = tokio::spawn(handle_accepted_client(accepted, addr, 0xABCD_1234, deps));
+        assert!(matches!(
+            dh_rx.recv().await,
+            Some(PTCPEvent::Connect(0xABCD_1234))
+        ));
+        conn_channels.lock().unwrap().remove(&0xABCD_1234);
+        setup.await.unwrap();
+
+        assert!(matches!(
+            dh_rx.recv().await,
+            Some(PTCPEvent::Disconnect(0xABCD_1234))
+        ));
+        assert!(
+            channels.lock().unwrap().is_empty(),
+            "failed realm channel should be removed"
+        );
+        assert!(
+            conn_channels.lock().unwrap().is_empty(),
+            "failed realm waiter should be removed"
         );
     }
 }
