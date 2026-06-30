@@ -58,9 +58,9 @@ Options:
       --heartbeat-interval-secs <secs>
           PTCP heartbeat send interval in seconds (default: 10)
       --heartbeat-missed-limit <count>
-          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 2)
+          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 1)
       --heartbeat-timeout-grace-secs <secs>
-          Extra grace period before restarting an inactive PTCP session (default: 10)
+          Extra grace period before restarting an inactive PTCP session (default: 0)
   -e, --enable-probe
           Enable HTTP probe server for liveness/readiness (/livez, /readyz)
   -P, --probe-port <port>
@@ -87,7 +87,7 @@ The Rust proxy sends PTCP heartbeats every `--heartbeat-interval-secs` and resta
 heartbeat_interval_secs * heartbeat_missed_limit + heartbeat_timeout_grace_secs
 ```
 
-The default is `10 * 2 + 10 = 30` seconds. The 10-second heartbeat cadence matches the native SDK's PTCP keepalive interval while preserving the same 30-second inactivity recovery window. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
+The default is `10 * 1 + 0 = 10` seconds. The 10-second heartbeat cadence matches the native SDK's PTCP keepalive interval, while the shorter watchdog reduces video loss during silent relay stalls. If an active PTCP heartbeat, bind, payload, or ACK send returns `ECONNREFUSED`, the proxy requests an immediate restart instead of waiting for the watchdog. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
 
 ### Jitter Buffer
 

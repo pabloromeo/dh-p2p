@@ -497,7 +497,9 @@ The SDK has two relevant PTCP keepalive layers:
 
 The SDK PTCP timeout constants extracted from `.rodata` include `10,000ms` and `30,000ms`. `CPtcpChannel::longTimeTaskDeal` uses a `30,000ms` channel heartbeat timeout, which matches this project's existing default inactivity window. The mismatch was not the watchdog duration itself, but the heartbeat cadence: this project used `2s * 10 + 10s = 30s`, while the native engine uses a 10-second keepalive cadence with the same 30-second effective timeout.
 
-Implementation update: local defaults and `run.sh` now use `--heartbeat-interval-secs 10 --heartbeat-missed-limit 2 --heartbeat-timeout-grace-secs 10`, preserving the 30-second watchdog while matching the SDK's observed PTCP keepalive cadence.
+Implementation update: local defaults and `run.sh` now use a 10-second heartbeat cadence to match the SDK's observed PTCP keepalive interval.
+
+Mitigation update: after homelab logs showed the relay path returning `ECONNREFUSED` around 30 minutes and the old 30-second watchdog causing roughly 32 seconds of video loss, the inactivity watchdog was shortened to `--heartbeat-interval-secs 10 --heartbeat-missed-limit 1 --heartbeat-timeout-grace-secs 0`. A later mitigation treats `ECONNREFUSED` on active PTCP heartbeat, bind, payload, or ACK sends as an immediate restart signal instead of waiting for that watchdog. This does not fix the root relay expiry problem, but should reduce video loss while preserving the SDK-like heartbeat cadence; the watchdog remains a fallback for silent stalls where no send error is surfaced.
 
 Open: no static `1800s` or `1,800,000ms` relay lifetime constant was found in the native library, and no obvious relay-renew endpoint was found beyond `/online/relay`, `/relay/agent`, `/relay/start`, relay-channel setup, and `/relay/unbind`. The 30-minute `ECONNREFUSED` issue may therefore be server-side relay allocation expiry or a subtler PTCP/accounting mismatch rather than a clearly named SDK renewal call.
 

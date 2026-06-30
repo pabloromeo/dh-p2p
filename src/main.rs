@@ -130,14 +130,14 @@ struct Cli {
     #[arg(
         long = "heartbeat-missed-limit",
         value_name = "count",
-        default_value = "2"
+        default_value = "1"
     )]
     heartbeat_missed_limit: u64,
     /// Extra grace period before restarting an inactive PTCP session
     #[arg(
         long = "heartbeat-timeout-grace-secs",
         value_name = "secs",
-        default_value = "10"
+        default_value = "0"
     )]
     heartbeat_timeout_grace_secs: u64,
     /// Enable HTTP probe server (/livez, /readyz)

@@ -82,6 +82,24 @@ fn log_ptcp_send_error(context: &str, error: &std::io::Error) {
     }
 }
 
+fn log_ptcp_send_error_and_restart(
+    context: &str,
+    error: &std::io::Error,
+    shutdown_tx: &watch::Sender<ShutdownReason>,
+) -> bool {
+    if error.kind() == std::io::ErrorKind::ConnectionRefused {
+        warn!(
+            "{} returned ECONNREFUSED; requesting immediate PTCP restart (err={})",
+            context, error
+        );
+        let _ = shutdown_tx.send(ShutdownReason::Restart);
+        true
+    } else {
+        log::error!("{} failed: {}", context, error);
+        false
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientChannel {
     buffer: Arc<tokio::sync::Mutex<VecDeque<Vec<u8>>>>,
@@ -491,7 +509,7 @@ pub async fn dh_writer(
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
     _shutdown: watch::Receiver<ShutdownReason>,
-    _shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
+    shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
     channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     health: Arc<HealthCounters>,
@@ -501,7 +519,9 @@ pub async fn dh_writer(
             PTCPEvent::Heartbeat => {
                 let p = session.lock().unwrap().send(PTCPBody::Heartbeat);
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log_ptcp_send_error("PTCP heartbeat send", &e);
+                    if log_ptcp_send_error_and_restart("PTCP heartbeat send", &e, &shutdown_tx) {
+                        break;
+                    }
                 }
             }
             PTCPEvent::Connect(realm) => {
@@ -514,7 +534,13 @@ pub async fn dh_writer(
                     realm, remote_port
                 );
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log_ptcp_send_error(&format!("PTCP bind send for realm {:08x}", realm), &e);
+                    if log_ptcp_send_error_and_restart(
+                        &format!("PTCP bind send for realm {:08x}", realm),
+                        &e,
+                        &shutdown_tx,
+                    ) {
+                        break;
+                    }
                 }
             }
             PTCPEvent::Disconnect(realm) => {
@@ -555,7 +581,13 @@ pub async fn dh_writer(
                     .unwrap()
                     .send(PTCPBody::Payload(PTCPPayload { realm, data }));
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log_ptcp_send_error(&format!("PTCP payload send for realm {:08x}", realm), &e);
+                    if log_ptcp_send_error_and_restart(
+                        &format!("PTCP payload send for realm {:08x}", realm),
+                        &e,
+                        &shutdown_tx,
+                    ) {
+                        break;
+                    }
                 }
             }
         }
@@ -777,7 +809,9 @@ pub async fn dh_reader(
                 // Send ACK
                 let p = session.lock().unwrap().send(PTCPBody::Empty);
                 if let Err(e) = socket.ptcp_request(p).await {
-                    log_ptcp_send_error("PTCP ack send", &e);
+                    if log_ptcp_send_error_and_restart("PTCP ack send", &e, &shutdown_tx) {
+                        break;
+                    }
                 }
 
                 match packet.body {
