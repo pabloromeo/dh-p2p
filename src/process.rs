@@ -416,6 +416,11 @@ pub async fn process_writer(
             }
             break;
         }
+
+        health
+            .bytes_to_clients
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        health.packets_to_clients.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -722,8 +727,10 @@ fn log_peer_reset_event(
 pub struct HealthCounters {
     pub bytes_from_device: AtomicU64,
     pub bytes_to_device: AtomicU64,
+    pub bytes_to_clients: AtomicU64,
     pub packets_from_device: AtomicU64,
     pub packets_to_device: AtomicU64,
+    pub packets_to_clients: AtomicU64,
     pub drops_newest: AtomicU64,
     pub drops_oldest: AtomicU64,
     pub jitter_enabled: AtomicBool,

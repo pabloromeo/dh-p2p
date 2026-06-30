@@ -505,15 +505,26 @@ async fn run_server_once(
                     _ = interval.tick() => {
                         let realms = health_channels.lock().unwrap().len();
                         let waiters = health_conn_channels.lock().unwrap().len();
-                        let bytes_in = health_counters.bytes_from_device.swap(0, Ordering::Relaxed);
-                        let bytes_out = health_counters.bytes_to_device.swap(0, Ordering::Relaxed);
-                        let pkts_in = health_counters.packets_from_device.swap(0, Ordering::Relaxed);
-                        let pkts_out = health_counters.packets_to_device.swap(0, Ordering::Relaxed);
+                        let device_to_proxy_bytes = health_counters
+                            .bytes_from_device
+                            .swap(0, Ordering::Relaxed);
+                        let client_to_device_bytes =
+                            health_counters.bytes_to_device.swap(0, Ordering::Relaxed);
+                        let proxy_to_client_bytes =
+                            health_counters.bytes_to_clients.swap(0, Ordering::Relaxed);
+                        let device_to_proxy_pkts = health_counters
+                            .packets_from_device
+                            .swap(0, Ordering::Relaxed);
+                        let client_to_device_pkts =
+                            health_counters.packets_to_device.swap(0, Ordering::Relaxed);
+                        let proxy_to_client_pkts =
+                            health_counters.packets_to_clients.swap(0, Ordering::Relaxed);
                         let drops_newest = health_counters.drops_newest.swap(0, Ordering::Relaxed);
                         let drops_oldest = health_counters.drops_oldest.swap(0, Ordering::Relaxed);
                         let interval = health_interval_secs as u64;
-                        let in_bps = bytes_in / interval;
-                        let out_bps = bytes_out / interval;
+                        let device_to_proxy_bps = device_to_proxy_bytes / interval;
+                        let client_to_device_bps = client_to_device_bytes / interval;
+                        let proxy_to_client_bps = proxy_to_client_bytes / interval;
                         let jitter_in_pkts = health_counters
                             .jitter_in_packets
                             .swap(0, Ordering::Relaxed);
@@ -535,15 +546,18 @@ async fn run_server_once(
                         let tcp_peer_reset_bursts =
                             health_counters.tcp_peer_reset_bursts.swap(0, Ordering::Relaxed);
                         info!(
-                            "Health realms={} waiters={} bytes_in={} bytes_out={} in_Bps={} out_Bps={} pkts_in={} pkts_out={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={} tcp_peer_disconnects={} tcp_peer_resets={} tcp_peer_reset_bursts={}",
+                            "Health realms={} waiters={} device_to_proxy_bytes={} client_to_device_bytes={} proxy_to_client_bytes={} device_to_proxy_Bps={} client_to_device_Bps={} proxy_to_client_Bps={} device_to_proxy_pkts={} client_to_device_pkts={} proxy_to_client_pkts={} drops_newest={} drops_oldest={} jitter_on={} jitter_in_pkts={} jitter_out_pkts={} jitter_in_bytes={} jitter_out_bytes={} jitter_late_drops={} jitter_max_depth={} tcp_peer_disconnects={} tcp_peer_resets={} tcp_peer_reset_bursts={}",
                             realms,
                             waiters,
-                            bytes_in,
-                            bytes_out,
-                            in_bps,
-                            out_bps,
-                            pkts_in,
-                            pkts_out,
+                            device_to_proxy_bytes,
+                            client_to_device_bytes,
+                            proxy_to_client_bytes,
+                            device_to_proxy_bps,
+                            client_to_device_bps,
+                            proxy_to_client_bps,
+                            device_to_proxy_pkts,
+                            client_to_device_pkts,
+                            proxy_to_client_pkts,
                             drops_newest,
                             drops_oldest,
                             health_counters.jitter_enabled.load(Ordering::Relaxed),
