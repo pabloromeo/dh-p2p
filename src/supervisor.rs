@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log::{info, warn};
 use rand::Rng;
@@ -39,6 +39,7 @@ pub async fn run_loop<F, Fut>(
     loop {
         iteration += 1;
         info!("Starting server iteration {}", iteration);
+        let iteration_started = Instant::now();
 
         let (shutdown_tx, shutdown_rx) = watch::channel::<ShutdownReason>(ShutdownReason::Stop);
         let shutdown_tx = Arc::new(shutdown_tx);
@@ -56,6 +57,7 @@ pub async fn run_loop<F, Fut>(
             shutdown_rx.clone(),
         )
         .await;
+        let iteration_duration = iteration_started.elapsed();
 
         match reason {
             ShutdownReason::Stop => {
@@ -63,6 +65,17 @@ pub async fn run_loop<F, Fut>(
                 break;
             }
             ShutdownReason::Restart => {
+                if iteration_duration
+                    >= Duration::from_secs(config.restart_backoff_reset_after_secs)
+                    && backoff_secs != config.restart_backoff_initial_secs
+                {
+                    info!(
+                        "Resetting restart backoff to {}s after healthy run of {}s",
+                        config.restart_backoff_initial_secs,
+                        iteration_duration.as_secs()
+                    );
+                    backoff_secs = config.restart_backoff_initial_secs;
+                }
                 warn!(
                     "Shutdown reason: Restart requested, re-handshaking... (iteration {}), backoff {}s",
                     iteration, backoff_secs

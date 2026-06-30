@@ -4,6 +4,7 @@ use log::{debug, error, info, trace, warn};
 use sha1::Digest;
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     io,
     net::SocketAddrV4,
     time::Instant,
@@ -15,6 +16,15 @@ use super::ptcp::{PTCPBody, PTCPPacket, PTCPSession, PTCP};
 
 static MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
 const RELAY_STOP_TIMEOUT: time::Duration = time::Duration::from_secs(2);
+const RELAY_SETUP_STEP_TIMEOUT: time::Duration = time::Duration::from_secs(2);
+const RELAY_SETUP_INITIAL_WAIT: time::Duration = time::Duration::from_millis(500);
+const RELAY_CHANNEL_INITIAL_WAIT: time::Duration = time::Duration::from_secs(2);
+const RELAY_SETUP_TOTAL_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+const RELAY_AUTH_RETRY_LIMIT: u8 = 3;
+const SDK_VERSION: &str = "6.7.11";
+const SDK_TS_VERSION: &str = "TS_1.1.4";
+const SDK_TOU_TYPE: &str = "Client/Dmss_Android";
+const SDK_TRANS_TYPE: &str = "1";
 
 static USERNAME: &str = "cba1b29e32cb17aa46b8ff9e73c7f40b";
 static USERKEY: &str = "996103384cdf19179e19243e959bbf8b";
@@ -22,20 +32,42 @@ static USERKEY: &str = "996103384cdf19179e19243e959bbf8b";
 #[derive(Clone, Debug)]
 pub struct RelayLease {
     token: String,
+    relay: String,
     agent: String,
 }
 
 impl RelayLease {
     pub async fn release(self) {
-        if let Err(e) = release_relay_session(&self.token, &self.agent).await {
+        if let Err(e) = release_relay_session(&self.token, &self.relay).await {
             warn!(
-                "Failed to release relay session (agent={}, token_len={}): {}",
+                "Failed to release relay session (relay={}, agent={}, token_len={}): {}",
+                self.relay,
                 self.agent,
                 self.token.len(),
                 e
             );
         } else {
-            info!("Released relay session for agent {}", self.agent);
+            info!(
+                "Released relay session for relay {} (agent={})",
+                self.relay, self.agent
+            );
+        }
+    }
+
+    pub async fn release_with_socket(self, socket: &UdpSocket) {
+        if let Err(e) = release_relay_session_on_socket(socket, &self.token, &self.relay).await {
+            warn!(
+                "Failed to release relay session with existing socket (relay={}, agent={}, token_len={}): {}",
+                self.relay,
+                self.agent,
+                self.token.len(),
+                e
+            );
+        } else {
+            info!(
+                "Released relay session for relay {} with existing socket (agent={})",
+                self.relay, self.agent
+            );
         }
     }
 }
@@ -74,6 +106,136 @@ fn response_body_field<'a>(res: &'a DHResponse, key: &str) -> io::Result<&'a str
 
 fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+async fn relay_setup_timeout<T, F>(action: impl Into<String>, future: F) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let action = action.into();
+    time::timeout(RELAY_SETUP_STEP_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out {} after {}s",
+                    action,
+                    RELAY_SETUP_STEP_TIMEOUT.as_secs()
+                ),
+            )
+        })?
+}
+
+fn next_relay_wait(wait: time::Duration) -> time::Duration {
+    wait.checked_mul(2)
+        .unwrap_or(RELAY_SETUP_TOTAL_TIMEOUT)
+        .min(RELAY_SETUP_TOTAL_TIMEOUT)
+}
+
+async fn sdk_relay_request(
+    socket: &UdpSocket,
+    connect_addr: Option<&str>,
+    path: &str,
+    body: Option<&str>,
+    cseq: &mut u32,
+    stage: &str,
+) -> io::Result<DHResponse> {
+    let started = Instant::now();
+    let mut wait = RELAY_SETUP_INITIAL_WAIT;
+    let mut attempt = 0u32;
+    let mut auth_failures = 0u8;
+
+    loop {
+        attempt += 1;
+        if started.elapsed() >= RELAY_SETUP_TOTAL_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{} timed out after {}s",
+                    stage,
+                    RELAY_SETUP_TOTAL_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+
+        if let Some(addr) = connect_addr {
+            relay_setup_timeout(
+                format!("connecting to {} for {}", addr, stage),
+                socket.connect(addr),
+            )
+            .await?;
+        }
+
+        relay_setup_timeout(
+            format!("sending {} ({})", path, stage),
+            socket.dh_request(path, body, cseq),
+        )
+        .await?;
+
+        let remaining = RELAY_SETUP_TOTAL_TIMEOUT.saturating_sub(started.elapsed());
+        let read_wait = wait.min(remaining);
+        debug!(
+            "{} waiting for response (attempt {}, wait_ms={}, elapsed_ms={})",
+            stage,
+            attempt,
+            read_wait.as_millis(),
+            started.elapsed().as_millis()
+        );
+
+        match time::timeout(read_wait, socket.dh_read_raw()).await {
+            Ok(Ok(res)) if res.code < 300 => {
+                debug!(
+                    "{} succeeded (attempt {}, code={}, status={}, body_keys={})",
+                    stage,
+                    attempt,
+                    res.code,
+                    res.status,
+                    body_keys(&res)
+                );
+                return Ok(res);
+            }
+            Ok(Ok(res)) if res.code == 401 => {
+                auth_failures += 1;
+                if auth_failures > RELAY_AUTH_RETRY_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{} failed authentication after {} retries",
+                            stage, RELAY_AUTH_RETRY_LIMIT
+                        ),
+                    ));
+                }
+                warn!(
+                    "{} got 401 Unauthorized; retrying auth-sensitive request ({}/{})",
+                    stage, auth_failures, RELAY_AUTH_RETRY_LIMIT
+                );
+                wait = next_relay_wait(wait);
+            }
+            Ok(Ok(res)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} error response: {} ({})", stage, res.status, res.code),
+                ));
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "{} response was invalid on attempt {}; retrying if time remains: {}",
+                    stage, attempt, e
+                );
+                wait = next_relay_wait(wait);
+            }
+            Err(_) => {
+                warn!(
+                    "{} timed out waiting for response on attempt {} after {}ms",
+                    stage,
+                    attempt,
+                    read_wait.as_millis()
+                );
+                wait = next_relay_wait(wait);
+            }
+        }
+    }
 }
 
 fn peer_addr_display(socket: &UdpSocket) -> String {
@@ -129,16 +291,20 @@ fn format_client_id(cid: &[u8; 8]) -> String {
         .join(" ")
 }
 
-fn socket_addr_body_value(socket: &UdpSocket) -> io::Result<String> {
-    Ok(socket.local_addr()?.to_string())
-}
-
 fn relay_channel_nonce() -> String {
     rand::random::<u32>().to_string()
 }
 
 fn relay_channel_create_date() -> String {
     chrono::Utc::now().timestamp().to_string()
+}
+
+fn pcs_request_id() -> String {
+    format!(
+        "{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    )
 }
 
 fn trace_peer(prefix: &str, socket: &UdpSocket) {
@@ -209,8 +375,8 @@ async fn discover_bootstrap(
         body_keys(&p2psrv_res)
     );
 
-    socket.dh_request("/online/relay", None, cseq).await?;
-    let relay_res = socket.dh_read().await?;
+    let relay_res =
+        sdk_relay_request(socket, None, "/online/relay", None, cseq, "online relay").await?;
     let relay = response_body_field(&relay_res, "body/Address")?.to_string();
     info!(
         "P2P bootstrap resolved relay for serial {}: relay={} (code={}, status={}, body_keys={})",
@@ -238,7 +404,7 @@ async fn request_p2p_channel(
     cid: &[u8; 8],
     cseq: &mut u32,
 ) -> io::Result<()> {
-    let local_addr = socket_addr_body_value(socket)?;
+    let local_addr = socket.local_addr()?.to_string();
     let body = xml_body(&[
         ("Identify", format_client_id(cid)),
         ("IpEncrpt", "true".to_string()),
@@ -265,14 +431,18 @@ async fn setup_relay_agent(
     serial: &str,
     cseq: &mut u32,
 ) -> io::Result<(String, String)> {
-    socket2.connect(relay).await?;
     debug!("Requesting relay agent...");
     let agent_body = xml_body(&[("Dev", serial.to_string())]);
     debug!("Relay agent request body_keys=Dev");
-    socket2
-        .dh_request("/relay/agent", Some(agent_body.as_ref()), cseq)
-        .await?;
-    let data = socket2.dh_read().await?;
+    let data = sdk_relay_request(
+        socket2,
+        Some(relay),
+        "/relay/agent",
+        Some(agent_body.as_ref()),
+        cseq,
+        "relay agent",
+    )
+    .await?;
     let token = response_body_field(&data, "body/Token")?.to_string();
     let agent = response_body_field(&data, "body/Agent")?.to_string();
     info!(
@@ -285,7 +455,6 @@ async fn setup_relay_agent(
         body_keys(&data)
     );
 
-    socket2.connect(&agent).await?;
     debug!(
         "Starting relay via agent {} (token_len={}, local_addr={})",
         agent,
@@ -295,19 +464,19 @@ async fn setup_relay_agent(
             .map(|addr| addr.to_string())
             .unwrap_or_else(|_| "<unknown>".to_string())
     );
-    let start_body = xml_body(&[
-        ("Client", socket_addr_body_value(socket2)?),
-        ("Dev", serial.to_string()),
-    ]);
+    let client = ":0".to_string();
+    let start_body = xml_body(&[("Client", client), ("Dev", serial.to_string())]);
+    let start_path = format!("/relay/start/{}", token);
     debug!("Relay start request body_keys=Client,Dev");
-    socket2
-        .dh_request(
-            format!("/relay/start/{}", token).as_ref(),
-            Some(start_body.as_ref()),
-            cseq,
-        )
-        .await?;
-    let start_res = socket2.dh_read().await?;
+    let start_res = sdk_relay_request(
+        socket2,
+        Some(&agent),
+        start_path.as_ref(),
+        Some(start_body.as_ref()),
+        cseq,
+        "relay start",
+    )
+    .await?;
     info!(
         "Relay started: agent={}, token_len={}, code={}, status={}, body_keys={}",
         agent,
@@ -343,44 +512,106 @@ async fn establish_relay_channel(
     agent: &str,
     cseq: &mut u32,
 ) -> io::Result<()> {
-    let max_retries = 5;
-    let mut attempt = 0;
+    let started = Instant::now();
+    let mut wait = RELAY_CHANNEL_INITIAL_WAIT;
+    let mut attempt = 0u32;
+    let mut auth_failures = 0u8;
+
     loop {
         attempt += 1;
         debug!(
-            "Setting up relay channel (attempt {}/{})...",
-            attempt, max_retries
+            "Setting up relay channel (attempt {}, wait_ms={}, elapsed_ms={})...",
+            attempt,
+            wait.as_millis(),
+            started.elapsed().as_millis()
         );
+        if started.elapsed() >= RELAY_SETUP_TOTAL_TIMEOUT {
+            error!(
+                "Failed to confirm relay channel after {} attempts over {}s",
+                attempt.saturating_sub(1),
+                RELAY_SETUP_TOTAL_TIMEOUT.as_secs()
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Relay channel confirmation timed out",
+            ));
+        }
 
-        socket2.connect(MAIN_SERVER).await?;
-        let relay_channel_body = xml_body(&[
+        relay_setup_timeout(
+            format!(
+                "connecting to main server for relay channel {}",
+                MAIN_SERVER
+            ),
+            socket2.connect(MAIN_SERVER),
+        )
+        .await?;
+        let mut relay_channel_fields = vec![
             ("CreateDate", relay_channel_create_date()),
             ("Nonce", relay_channel_nonce()),
             ("agentAddr", agent.to_string()),
-        ]);
-        debug!("Relay channel request body_keys=CreateDate,Nonce,agentAddr");
-        socket2
-            .dh_request(
+        ];
+        relay_channel_fields.push(("TransType", SDK_TRANS_TYPE.to_string()));
+        let relay_channel_body = xml_body(&relay_channel_fields);
+        debug!("Relay channel request body_keys=CreateDate,Nonce,TransType,agentAddr");
+        relay_setup_timeout(
+            "sending relay channel request",
+            socket2.dh_request(
                 format!("/device/{}/relay-channel", serial).as_ref(),
                 Some(relay_channel_body.as_ref()),
                 cseq,
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
-        socket2.connect(agent).await?;
+        relay_setup_timeout(
+            format!(
+                "connecting to relay agent {} for channel confirmation",
+                agent
+            ),
+            socket2.connect(agent),
+        )
+        .await?;
         debug!(
-            "Waiting for relay channel confirmation from agent {} (attempt {}/{})",
-            agent, attempt, max_retries
+            "Waiting for relay channel confirmation from agent {} (attempt {})",
+            agent, attempt
         );
 
-        match time::timeout(time::Duration::from_millis(500), socket2.dh_read()).await {
+        let remaining = RELAY_SETUP_TOTAL_TIMEOUT.saturating_sub(started.elapsed());
+        let read_wait = wait.min(remaining);
+        match time::timeout(read_wait, socket2.dh_read_raw()).await {
             Ok(Ok(res)) => {
+                if res.code == 401 {
+                    auth_failures += 1;
+                    if auth_failures > RELAY_AUTH_RETRY_LIMIT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "relay channel failed authentication after {} retries",
+                                RELAY_AUTH_RETRY_LIMIT
+                            ),
+                        ));
+                    }
+                    warn!(
+                        "Relay channel got 401 Unauthorized; retrying auth-sensitive request ({}/{})",
+                        auth_failures, RELAY_AUTH_RETRY_LIMIT
+                    );
+                    wait = next_relay_wait(wait);
+                    continue;
+                }
+                if res.code >= 300 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Relay channel error response: {} ({})",
+                            res.status, res.code
+                        ),
+                    ));
+                }
                 info!(
-                    "Relay channel ready for serial {} via agent {} (attempt {}/{}, code={}, status={}, body_keys={})",
+                    "Relay channel ready for serial {} via agent {} (attempt {}, code={}, status={}, body_keys={})",
                     serial,
                     agent,
                     attempt,
-                    max_retries,
                     res.code,
                     res.status,
                     body_keys(&res)
@@ -392,62 +623,65 @@ async fn establish_relay_channel(
                     "Relay channel setup response was invalid (attempt {}): {}",
                     attempt, e
                 );
-                if attempt >= max_retries {
-                    return Err(e);
-                }
+                wait = next_relay_wait(wait);
             }
             Err(_) => {
-                warn!(
-                    "Timed out waiting for relay channel confirmation (attempt {})",
-                    attempt
+                debug!(
+                    "Timed out waiting for relay channel confirmation (attempt {}, wait_ms={})",
+                    attempt,
+                    read_wait.as_millis()
                 );
-                if attempt >= max_retries {
-                    error!(
-                        "Failed to confirm relay channel after {} attempts",
-                        max_retries
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Relay channel confirmation timed out",
-                    ));
-                }
+                wait = next_relay_wait(wait);
             }
         }
     }
 }
 
-async fn release_relay_session(token: &str, agent: &str) -> io::Result<()> {
+async fn release_relay_session(token: &str, relay: &str) -> io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    release_relay_session_on_socket(&socket, token, relay).await
+}
+
+async fn release_relay_session_on_socket(
+    socket: &UdpSocket,
+    token: &str,
+    relay: &str,
+) -> io::Result<()> {
     let mut cseq = 0;
-    time::timeout(RELAY_STOP_TIMEOUT, socket.connect(agent))
+    time::timeout(RELAY_STOP_TIMEOUT, socket.connect(relay))
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
-                "timed out connecting to relay agent",
+                "timed out connecting to relay server",
             )
         })??;
     time::timeout(
         RELAY_STOP_TIMEOUT,
-        socket.dh_request(format!("/relay/stop/{}", token).as_ref(), None, &mut cseq),
+        socket.dh_request(format!("/relay/unbind/{}", token).as_ref(), None, &mut cseq),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out sending /relay/stop"))??;
-    // Best-effort cleanup: some relay agents may not acknowledge stop,
-    // and UDP replies can be dropped. A missing response should not fail shutdown.
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out sending /relay/unbind"))??;
+    // Best-effort cleanup: the SDK sends unbind asynchronously, so a missing
+    // UDP acknowledgement should not fail shutdown.
     match time::timeout(RELAY_STOP_TIMEOUT, socket.dh_read()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             warn!(
-                "relay stop returned error response, continuing anyway: {}",
+                "relay unbind returned error response, continuing anyway: {}",
                 e
             );
         }
         Err(_) => {
-            debug!("relay stop returned no response before timeout; continuing");
+            debug!("relay unbind returned no response before timeout; continuing");
         }
     }
     Ok(())
+}
+
+async fn release_relay_then_err<T>(lease: RelayLease, err: io::Error) -> io::Result<T> {
+    lease.release().await;
+    Err(err)
 }
 
 async fn negotiate_relay_sign(
@@ -638,17 +872,31 @@ pub async fn p2p_handshake(
 
     info!("Setting up relay connection...");
     let (token, agent) = setup_relay_agent(&socket2, &relay, &serial, &mut cseq).await?;
-    let relay_lease = Some(RelayLease {
+    let relay_lease = RelayLease {
         token,
+        relay: relay.clone(),
         agent: agent.clone(),
-    });
-    let res = wait_device_channel_response(&socket).await?;
+    };
+    let res = match wait_device_channel_response(&socket).await {
+        Ok(res) => res,
+        Err(e) => return release_relay_then_err(relay_lease, e).await,
+    };
 
-    let device_laddr = response_body_field(&res, "body/LocalAddr")?;
-    let device = response_body_field(&res, "body/PubAddr")?;
+    let device_laddr = match response_body_field(&res, "body/LocalAddr") {
+        Ok(value) => value,
+        Err(e) => return release_relay_then_err(relay_lease, e).await,
+    };
+    let device = match response_body_field(&res, "body/PubAddr") {
+        Ok(value) => value,
+        Err(e) => return release_relay_then_err(relay_lease, e).await,
+    };
 
-    socket.connect(device).await?;
-    establish_relay_channel(&socket2, &serial, &agent, &mut cseq).await?;
+    if let Err(e) = socket.connect(device).await {
+        return release_relay_then_err(relay_lease, e).await;
+    }
+    if let Err(e) = establish_relay_channel(&socket2, &serial, &agent, &mut cseq).await {
+        return release_relay_then_err(relay_lease, e).await;
+    }
     info!("Relay channel established; starting PTCP handshake");
 
     info!(
@@ -657,21 +905,33 @@ pub async fn p2p_handshake(
     );
     let mut session = PTCPSession::new();
 
-    socket2.ptcp_request(session.send(PTCPBody::Sync)).await?;
-    session.recv(socket2.ptcp_read().await?);
+    if let Err(e) = socket2.ptcp_request(session.send(PTCPBody::Sync)).await {
+        return release_relay_then_err(relay_lease, e).await;
+    }
+    let sync_response = match socket2.ptcp_read().await {
+        Ok(packet) => packet,
+        Err(e) => return release_relay_then_err(relay_lease, e.into()).await,
+    };
+    session.recv(sync_response);
 
     if relay_mode {
         info!("Relay mode enabled");
-        return Ok((socket2, session, relay_lease));
+        return Ok((socket2, session, Some(relay_lease)));
     }
 
-    let sign = negotiate_relay_sign(&socket2, &mut session).await?;
+    let sign = match negotiate_relay_sign(&socket2, &mut session).await {
+        Ok(sign) => sign,
+        Err(e) => return release_relay_then_err(relay_lease, e).await,
+    };
 
     info!(
         "Establishing direct P2P connection (serial={}, relay={})...",
         serial, relay_mode
     );
-    let session = perform_direct_handshake(&socket, device, device_laddr, &cid, &sign).await?;
+    let session = match perform_direct_handshake(&socket, device, device_laddr, &cid, &sign).await {
+        Ok(session) => session,
+        Err(e) => return release_relay_then_err(relay_lease, e).await,
+    };
 
     info!(
         "P2P handshake complete (serial={}, relay={}, elapsed_ms={})",
@@ -679,7 +939,7 @@ pub async fn p2p_handshake(
         relay_mode,
         start.elapsed().as_millis()
     );
-    Ok((socket, session, relay_lease))
+    Ok((socket, session, Some(relay_lease)))
 }
 
 #[derive(Debug)]
@@ -795,9 +1055,9 @@ trait DHP2P {
 #[async_trait]
 impl DHP2P for UdpSocket {
     async fn dh_request(&self, path: &str, body: Option<&str>, seq: &mut u32) -> io::Result<()> {
-        let method = match body {
-            Some(_) => "DHPOST",
-            None => "DHGET",
+        let method = match body.is_some() {
+            true => "NFPOST",
+            false => "NFGET",
         };
 
         let body = match body {
@@ -818,10 +1078,28 @@ impl DHP2P for UdpSocket {
 
         let req = format!("\
             {} {} HTTP/1.1\r\n\
+            X-Version: {}\r\n\
+            X-TSVersion: {}\r\n\
+            x-pcs-request-id: {}\r\n\
+            X-ToUType: {}\r\n\
             CSeq: {}\r\n\
             Authorization: WSSE profile=\"UsernameToken\"\r\n\
-            X-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n\r\n{}",
-            method, path, seq, USERNAME, digest, nonce, currdate, body,
+            X-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n\
+            Content-Type: \r\n\
+            Content-Length: {}\r\n\r\n{}",
+            method,
+            path,
+            SDK_VERSION,
+            SDK_TS_VERSION,
+            pcs_request_id(),
+            SDK_TOU_TYPE,
+            seq,
+            USERNAME,
+            digest,
+            nonce,
+            currdate,
+            body.as_bytes().len(),
+            body,
         );
 
         debug!(">>> {} {}", peer_addr_display(self), path);
@@ -856,7 +1134,10 @@ impl DHP2P for UdpSocket {
 
 #[cfg(test)]
 mod tests {
-    use super::{command_tail, format_client_id, parse_header_line, xml_body, DHResponse};
+    use super::{
+        command_tail, format_client_id, next_relay_wait, parse_header_line, xml_body, DHResponse,
+        RELAY_SETUP_INITIAL_WAIT, RELAY_SETUP_TOTAL_TIMEOUT,
+    };
     use crate::transport::ptcp::PTCPBody;
     use rand::{rngs::StdRng, Rng, SeedableRng};
     use std::panic;
@@ -931,6 +1212,21 @@ mod tests {
     fn format_client_id_matches_sdk_style_hex_bytes() {
         let cid = [0x00, 0x01, 0x0a, 0x10, 0xab, 0xcd, 0xef, 0xff];
         assert_eq!(format_client_id(&cid), "0 1 a 10 ab cd ef ff");
+    }
+
+    #[test]
+    fn relay_wait_backoff_doubles_until_setup_cap() {
+        let first = RELAY_SETUP_INITIAL_WAIT;
+        let second = next_relay_wait(first);
+        let third = next_relay_wait(second);
+
+        assert_eq!(first.as_millis(), 500);
+        assert_eq!(second.as_millis(), 1000);
+        assert_eq!(third.as_millis(), 2000);
+        assert_eq!(
+            next_relay_wait(RELAY_SETUP_TOTAL_TIMEOUT),
+            RELAY_SETUP_TOTAL_TIMEOUT
+        );
     }
 
     #[test]

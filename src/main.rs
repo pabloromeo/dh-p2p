@@ -66,6 +66,31 @@ async fn ready_handler(State(state): State<ProbeState>) -> StatusCode {
     }
 }
 
+fn spawn_probe_server(
+    config: &Config,
+    probe_state: ProbeState,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !config.enable_probe {
+        return None;
+    }
+
+    let addr: SocketAddr = format!("0.0.0.0:{}", config.probe_port)
+        .parse()
+        .expect("invalid probe port");
+    info!("HTTP probe enabled on port {}", config.probe_port);
+
+    Some(tokio::spawn(async move {
+        let app = Router::new()
+            .route("/livez", get(live_handler))
+            .route("/readyz", get(ready_handler))
+            .with_state(probe_state);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("failed to bind probe port");
+        let _ = serve(listener, app).await;
+    }))
+}
+
 #[derive(Parser)]
 #[command(about = "A PoC implementation of TCP tunneling over Dahua P2P protocol.", long_about = None)]
 struct Cli {
@@ -185,6 +210,8 @@ async fn main() {
     };
     let config = Arc::new(config);
     let metrics: MetricsHandle = Arc::new(InMemoryMetrics::default());
+    let probe_state = ProbeState::default();
+    let probe_handle = spawn_probe_server(&config, probe_state.clone());
 
     let parts: Vec<&str> = port.split(':').collect();
     let (bind_address, bind_port, remote_port): (&str, u16, u16) = match parts.len() {
@@ -219,23 +246,31 @@ async fn main() {
          config,
          metrics,
          shutdown_tx,
-         shutdown_rx| async move {
-            run_server_once(
-                bind_address,
-                bind_port,
-                remote_port,
-                serial,
-                relay,
-                buffer_ms,
-                config,
-                metrics,
-                shutdown_tx,
-                shutdown_rx,
-            )
-            .await
+         shutdown_rx| {
+            let probe_state = probe_state.clone();
+            async move {
+                run_server_once(
+                    bind_address,
+                    bind_port,
+                    remote_port,
+                    serial,
+                    relay,
+                    buffer_ms,
+                    config,
+                    metrics,
+                    shutdown_tx,
+                    shutdown_rx,
+                    probe_state,
+                )
+                .await
+            }
         },
     )
     .await;
+
+    if let Some(handle) = probe_handle {
+        handle.abort();
+    }
 }
 
 async fn run_server_once(
@@ -249,7 +284,11 @@ async fn run_server_once(
     metrics: MetricsHandle,
     shutdown_tx_external: Arc<watch::Sender<ShutdownReason>>,
     shutdown_rx_external: watch::Receiver<ShutdownReason>,
+    probe_state: ProbeState,
 ) -> ShutdownReason {
+    probe_state.handshake_ready.store(false, Ordering::Relaxed);
+    probe_state.heartbeat_ok.store(false, Ordering::Relaxed);
+
     // Bind the listener to the address
     let listener = TcpListener::bind(format!("{}:{}", bind_address, bind_port))
         .await
@@ -296,12 +335,6 @@ async fn run_server_once(
         Duration::from_secs(60),
         config.reset_burst_warn_threshold_per_minute,
     ));
-    let probe_state = ProbeState::default();
-    let probe_state_opt = if config.enable_probe {
-        Some(probe_state.clone())
-    } else {
-        None
-    };
 
     let channels = Arc::new(Mutex::new(HashMap::<u32, ClientChannel>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
@@ -310,10 +343,8 @@ async fn run_server_once(
         "PTCP session established (serial={}, relay={}, remote_port={})",
         serial, relay, remote_port
     );
-    if let Some(state) = probe_state_opt.as_ref() {
-        state.handshake_ready.store(true, Ordering::Relaxed);
-        state.heartbeat_ok.store(true, Ordering::Relaxed);
-    }
+    probe_state.handshake_ready.store(true, Ordering::Relaxed);
+    probe_state.heartbeat_ok.store(true, Ordering::Relaxed);
     metrics.inc_counter("handshake_success");
 
     /*
@@ -322,6 +353,7 @@ async fn run_server_once(
 
     let reader = Arc::new(socket);
     let writer = reader.clone();
+    let relay_release_socket = reader.clone();
 
     let session2 = session.clone();
     let channels2 = channels.clone();
@@ -407,11 +439,7 @@ async fn run_server_once(
     let drop_policy = config.drop_policy.clone();
     let channel_capacity = config.channel_capacity;
     let health_reader = health.clone();
-    let heartbeat_ok_flag = if config.enable_probe {
-        Some(probe_state.heartbeat_ok.clone())
-    } else {
-        None
-    };
+    let heartbeat_ok_flag = Some(probe_state.heartbeat_ok.clone());
     let reader_handle = tokio::spawn(async move {
         dh_reader(
             session2,
@@ -435,11 +463,7 @@ async fn run_server_once(
     let shutdown_tx_watchdog = shutdown_tx.clone();
     let last_activity_watchdog = last_activity.clone();
     let watchdog_config = config.clone();
-    let heartbeat_flag = if config.enable_probe {
-        Some(probe_state.heartbeat_ok.clone())
-    } else {
-        None
-    };
+    let heartbeat_flag = Some(probe_state.heartbeat_ok.clone());
     let watchdog_handle = tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(watchdog_config.heartbeat_interval_secs));
@@ -540,33 +564,6 @@ async fn run_server_once(
         }))
     };
 
-    // Probe server
-    let probe_handle = if config.enable_probe {
-        let probe_state_server = probe_state.clone();
-        let mut probe_shutdown = shutdown_rx.clone();
-        let addr: SocketAddr = format!("0.0.0.0:{}", config.probe_port)
-            .parse()
-            .expect("invalid probe port");
-        info!("HTTP probe enabled on port {}", config.probe_port);
-        Some(tokio::spawn(async move {
-            let app = Router::new()
-                .route("/livez", get(live_handler))
-                .route("/readyz", get(ready_handler))
-                .with_state(probe_state_server);
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .expect("failed to bind probe port");
-            let serve_fut = serve(listener, app);
-            let _ = serve_fut
-                .with_graceful_shutdown(async move {
-                    let _ = probe_shutdown.changed().await;
-                })
-                .await;
-        }))
-    } else {
-        None
-    };
-
     info!(
         "Ready to accept TCP clients on {}:{} (remote_port={}, buffer_ms={}, drop_policy={:?})",
         bind_address, bind_port, remote_port, buffer_ms, config.drop_policy
@@ -642,6 +639,7 @@ async fn run_server_once(
         }
     }
 
+    drop(accept_pipeline);
     channels2.lock().unwrap().clear();
     conn_channels2.lock().unwrap().clear();
     drop(dh_tx);
@@ -654,15 +652,15 @@ async fn run_server_once(
     if let Some(handle) = health_handle {
         let _ = handle.await;
     }
-    if let Some(state) = probe_state_opt.as_ref() {
-        state.handshake_ready.store(false, Ordering::Relaxed);
-        state.heartbeat_ok.store(false, Ordering::Relaxed);
-    }
-    if let Some(handle) = probe_handle {
-        let _ = handle.await;
-    }
+    probe_state.handshake_ready.store(false, Ordering::Relaxed);
+    probe_state.heartbeat_ok.store(false, Ordering::Relaxed);
+
     if let Some(lease) = relay_lease {
-        lease.release().await;
+        if relay {
+            lease.release_with_socket(&relay_release_socket).await;
+        } else {
+            lease.release().await;
+        }
     }
 
     if shutdown_reason == ShutdownReason::Restart {

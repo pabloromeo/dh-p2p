@@ -490,20 +490,13 @@ pub async fn dh_writer(
     socket: Arc<UdpSocket>,
     mut dh_rx: mpsc::Receiver<PTCPEvent>,
     remote_port: u32,
-    mut shutdown: watch::Receiver<ShutdownReason>,
+    _shutdown: watch::Receiver<ShutdownReason>,
     _shutdown_tx: Arc<watch::Sender<ShutdownReason>>,
     channels: Arc<Mutex<HashMap<u32, ClientChannel>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     health: Arc<HealthCounters>,
 ) {
-    loop {
-        let ev = tokio::select! {
-            ev = dh_rx.recv() => ev,
-            _ = shutdown.changed() => None,
-        };
-
-        let Some(ev) = ev else { break };
-
+    while let Some(ev) = dh_rx.recv().await {
         match ev {
             PTCPEvent::Heartbeat => {
                 let p = session.lock().unwrap().send(PTCPBody::Heartbeat);
