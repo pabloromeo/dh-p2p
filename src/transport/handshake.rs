@@ -13,6 +13,7 @@ use tokio::{net::UdpSocket, time};
 use xml::reader::{EventReader, XmlEvent};
 
 use super::ptcp::{PTCPBody, PTCPPacket, PTCPSession, PTCP};
+use crate::shutdown::ShutdownReason;
 
 static MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
 const RELAY_STOP_TIMEOUT: time::Duration = time::Duration::from_secs(2);
@@ -54,8 +55,10 @@ impl RelayLease {
         }
     }
 
-    pub async fn release_with_socket(self, socket: &UdpSocket) {
-        if let Err(e) = release_relay_session_on_socket(socket, &self.token, &self.relay).await {
+    pub async fn release_with_socket(self, socket: &UdpSocket, reason: ShutdownReason) {
+        if let Err(e) =
+            release_relay_session_on_socket(socket, &self.token, &self.relay, reason).await
+        {
             warn!(
                 "Failed to release relay session with existing socket (relay={}, agent={}, token_len={}): {}",
                 self.relay,
@@ -639,13 +642,14 @@ async fn establish_relay_channel(
 
 async fn release_relay_session(token: &str, relay: &str) -> io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    release_relay_session_on_socket(&socket, token, relay).await
+    release_relay_session_on_socket(&socket, token, relay, ShutdownReason::Stop).await
 }
 
 async fn release_relay_session_on_socket(
     socket: &UdpSocket,
     token: &str,
     relay: &str,
+    reason: ShutdownReason,
 ) -> io::Result<()> {
     let mut cseq = 0;
     time::timeout(RELAY_STOP_TIMEOUT, socket.connect(relay))
@@ -667,10 +671,16 @@ async fn release_relay_session_on_socket(
     match time::timeout(RELAY_STOP_TIMEOUT, socket.dh_read()).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            warn!(
-                "relay unbind returned error response, continuing anyway: {}",
-                e
-            );
+            if reason.is_ptcp_send_refused() && e.to_string().contains("403") {
+                info!(
+                    "relay unbind returned 403 after PTCP ECONNREFUSED; treating as expired lease cleanup noise"
+                );
+            } else {
+                warn!(
+                    "relay unbind returned error response during {:?}, continuing anyway: {}",
+                    reason, e
+                );
+            }
         }
         Err(_) => {
             debug!("relay unbind returned no response before timeout; continuing");

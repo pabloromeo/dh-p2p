@@ -92,7 +92,7 @@ fn log_ptcp_send_error_and_restart(
             "{} returned ECONNREFUSED; requesting immediate PTCP restart (err={})",
             context, error
         );
-        let _ = shutdown_tx.send(ShutdownReason::Restart);
+        let _ = shutdown_tx.send(ShutdownReason::RestartPtcpSendRefused);
         true
     } else {
         log::error!("{} failed: {}", context, error);
@@ -788,7 +788,7 @@ pub async fn dh_reader(
                         // Handle read errors
                         if e.is_fatal() {
                             warn!("PTCP fatal read error: {}, triggering restart", e);
-                            let _ = shutdown_tx.send(ShutdownReason::Restart);
+                            let _ = shutdown_tx.send(ShutdownReason::RestartPtcpReadFatal);
                             break;
                         }
                         // Non-fatal errors (malformed packets) - log and continue

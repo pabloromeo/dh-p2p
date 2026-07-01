@@ -497,11 +497,39 @@ The SDK has two relevant PTCP keepalive layers:
 
 The SDK PTCP timeout constants extracted from `.rodata` include `10,000ms` and `30,000ms`. `CPtcpChannel::longTimeTaskDeal` uses a `30,000ms` channel heartbeat timeout, which matches this project's existing default inactivity window. The mismatch was not the watchdog duration itself, but the heartbeat cadence: this project used `2s * 10 + 10s = 30s`, while the native engine uses a 10-second keepalive cadence with the same 30-second effective timeout.
 
-Implementation update: local defaults and `run.sh` now use a 10-second heartbeat cadence to match the SDK's observed PTCP keepalive interval.
+Implementation update: local defaults and `run.sh` were first moved to a 10-second heartbeat cadence to match the SDK's observed lower PTCP keepalive interval.
 
 Mitigation update: after homelab logs showed the relay path returning `ECONNREFUSED` around 30 minutes and the old 30-second watchdog causing roughly 32 seconds of video loss, the inactivity watchdog was shortened to `--heartbeat-interval-secs 10 --heartbeat-missed-limit 1 --heartbeat-timeout-grace-secs 0`. A later mitigation treats `ECONNREFUSED` on active PTCP heartbeat, bind, payload, or ACK sends as an immediate restart signal instead of waiting for that watchdog. This does not fix the root relay expiry problem, but should reduce video loss while preserving the SDK-like heartbeat cadence; the watchdog remains a fallback for silent stalls where no send error is surfaced.
 
+SDK proxy keepalive experiment: `CProxyChannelClient::longTimeTaskDeal` appears to call `CProxyChannel::sendKeepAlive` every five one-second ticks. The current experiment therefore sends the same `0x13` PTCP heartbeat body every 5 seconds while keeping a 10-second watchdog via `--heartbeat-interval-secs 5 --heartbeat-missed-limit 2 --heartbeat-timeout-grace-secs 0`. The intent is to test the SDK proxy-channel cadence without changing DevAuth or the existing lower PTCP packet format.
+
 Open: no static `1800s` or `1,800,000ms` relay lifetime constant was found in the native library, and no obvious relay-renew endpoint was found beyond `/online/relay`, `/relay/agent`, `/relay/start`, relay-channel setup, and `/relay/unbind`. The 30-minute `ECONNREFUSED` issue may therefore be server-side relay allocation expiry or a subtler PTCP/accounting mismatch rather than a clearly named SDK renewal call.
+
+### SDK Flow Parity Audit
+
+Confirmed matching behavior between the SDK and this Rust implementation:
+
+- Relay setup follows the same broad order: bootstrap discovery, device probe, p2p-channel request, relay agent/start, relay-channel setup, then PTCP sync.
+- Relay setup retry behavior now uses the SDK-style retry cap and bounded setup timeout.
+- Relay cleanup targets `/relay/unbind/{token}`.
+- The PTCP heartbeat payload is the SDK-style 12-byte `0x13` body.
+- PTCP receive cursor and timestamp/echo fields match the observed SDK packet shape more closely than the original counter-based implementation.
+
+Confirmed missing behavior:
+
+- The SDK proxy-channel keepalive cadence is 5 seconds; this is now implemented as an experiment using the existing heartbeat packet.
+- The SDK has a dual-channel link-switch path with a secondary `CPtcpChannel`; this implementation owns one active `UdpSocket` and one active `PTCPSession`.
+- The SDK performs ICE/link-through checks before switching. This project only attempts direct P2P during initial handshake.
+- The SDK uses pause/resume control around channel switching (`sendPause`, `sendResume`, `sendResumeSuccess`); this implementation only has per-realm connect, disconnect, payload, ACK, and heartbeat events.
+- The SDK has richer teardown state. This implementation now logs typed restart causes and treats relay `403` unbind after PTCP `ECONNREFUSED` as expected expired-lease cleanup noise.
+
+Out of scope for this pass: DevAuth remains unimplemented unless later evidence shows it is required for lease renewal or for the 30-minute failure mode.
+
+### Link Switching Feasibility
+
+The SDK link-switch path is a hot relay-to-direct migration, not a relay refresh. `isNeedLinkSwitch` only proceeds when the current PTCP link type is relay, switching is enabled, and no switch is already in progress. `iceCheck` allocates a secondary `CProxyP2PClient`/`CLinkThroughClient` path and moves the SDK switch state forward. `procLinkSwitch` then pauses the active receive path, waits through switch states, calls `switchChannel`, swaps the active `CPtcpChannel` pointer with the secondary channel, sends resume success, and restarts receive.
+
+This project has enough initial-handshake pieces to open either relay PTCP or direct PTCP at startup, but not enough ownership structure for make-before-break link switching. The current data plane assumes one active socket/session pair shared by the reader, writer, heartbeat, watchdog, active realm maps, and RTSP client continuity. Implementing SDK-style switching would require a separate design for overlapping sessions, pause/resume packets, realm draining or transfer, and an atomic data-plane swap. It should remain a follow-up after a controlled experiment proves the device accepts an overlapping secondary session while the relay stream remains active.
 
 ### Native PTCP Sequence and Timestamp Fields
 

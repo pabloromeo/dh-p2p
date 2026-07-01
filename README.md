@@ -56,9 +56,9 @@ Options:
   -H, --health-interval-secs <secs>
           Interval for periodic health logs (default: 60)
       --heartbeat-interval-secs <secs>
-          PTCP heartbeat send interval in seconds (default: 10)
+          SDK proxy/PTCP keepalive send interval in seconds (default: 5)
       --heartbeat-missed-limit <count>
-          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 1)
+          Consecutive heartbeat intervals without inbound PTCP activity before restart (default: 2)
       --heartbeat-timeout-grace-secs <secs>
           Extra grace period before restarting an inactive PTCP session (default: 0)
   -e, --enable-probe
@@ -87,7 +87,7 @@ The Rust proxy sends PTCP heartbeats every `--heartbeat-interval-secs` and resta
 heartbeat_interval_secs * heartbeat_missed_limit + heartbeat_timeout_grace_secs
 ```
 
-The default is `10 * 1 + 0 = 10` seconds. The 10-second heartbeat cadence matches the native SDK's PTCP keepalive interval, while the shorter watchdog reduces video loss during silent relay stalls. If an active PTCP heartbeat, bind, payload, or ACK send returns `ECONNREFUSED`, the proxy requests an immediate restart instead of waiting for the watchdog. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
+The default is `5 * 2 + 0 = 10` seconds. The 5-second heartbeat cadence is an SDK proxy-channel keepalive experiment based on the native `CProxyChannelClient` long-time task, while the 10-second watchdog keeps the existing low-loss fallback for silent relay stalls. If an active PTCP heartbeat, bind, payload, or ACK send returns `ECONNREFUSED`, the proxy requests an immediate restart instead of waiting for the watchdog. For Kubernetes deployments, keep these values explicit in the manifest so watchdog behavior is obvious during operations.
 
 ### Jitter Buffer
 

@@ -40,8 +40,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            heartbeat_interval_secs: 10,
-            heartbeat_missed_limit: 1,
+            heartbeat_interval_secs: 5,
+            heartbeat_missed_limit: 2,
             heartbeat_timeout_grace_secs: 0,
             health_interval_secs: 60,
             enable_probe: false,
@@ -73,11 +73,11 @@ mod tests {
     }
 
     #[test]
-    fn default_ptcp_inactivity_timeout_is_less_eager_than_heartbeat_interval() {
+    fn default_ptcp_inactivity_timeout_uses_sdk_proxy_keepalive_experiment() {
         let cfg = Config::default();
 
-        assert_eq!(cfg.heartbeat_interval_secs, 10);
-        assert_eq!(cfg.heartbeat_missed_limit, 1);
+        assert_eq!(cfg.heartbeat_interval_secs, 5);
+        assert_eq!(cfg.heartbeat_missed_limit, 2);
         assert_eq!(cfg.heartbeat_timeout_grace_secs, 0);
         assert_eq!(cfg.ptcp_inactivity_timeout_secs(), 10);
     }

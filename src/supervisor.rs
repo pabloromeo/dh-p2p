@@ -64,7 +64,7 @@ pub async fn run_loop<F, Fut>(
                 info!("Shutdown reason: Stop (iteration {})", iteration);
                 break;
             }
-            ShutdownReason::Restart => {
+            restart_reason if restart_reason.is_restart() => {
                 if iteration_duration
                     >= Duration::from_secs(config.restart_backoff_reset_after_secs)
                     && backoff_secs != config.restart_backoff_initial_secs
@@ -77,8 +77,8 @@ pub async fn run_loop<F, Fut>(
                     backoff_secs = config.restart_backoff_initial_secs;
                 }
                 warn!(
-                    "Shutdown reason: Restart requested, re-handshaking... (iteration {}), backoff {}s",
-                    iteration, backoff_secs
+                    "Shutdown reason: {:?}, re-handshaking... (iteration {}), backoff {}s",
+                    restart_reason, iteration, backoff_secs
                 );
                 metrics.inc_counter("restart");
                 let jitter_ms = rand::thread_rng().gen_range(0..=config.restart_backoff_jitter_ms);
@@ -87,6 +87,13 @@ pub async fn run_loop<F, Fut>(
                 tokio::time::sleep(sleep_dur).await;
                 backoff_secs =
                     (backoff_secs.saturating_mul(2)).min(config.restart_backoff_max_secs);
+            }
+            other => {
+                warn!(
+                    "Unexpected shutdown reason {:?}; stopping supervisor",
+                    other
+                );
+                break;
             }
         }
     }

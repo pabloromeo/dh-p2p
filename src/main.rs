@@ -119,18 +119,18 @@ struct Cli {
         default_value = "60"
     )]
     health_interval_secs: u64,
-    /// PTCP heartbeat send interval in seconds
+    /// SDK proxy/PTCP keepalive send interval in seconds
     #[arg(
         long = "heartbeat-interval-secs",
         value_name = "secs",
-        default_value = "10"
+        default_value = "5"
     )]
     heartbeat_interval_secs: u64,
     /// Consecutive heartbeat intervals without inbound PTCP activity before restart
     #[arg(
         long = "heartbeat-missed-limit",
         value_name = "count",
-        default_value = "1"
+        default_value = "2"
     )]
     heartbeat_missed_limit: u64,
     /// Extra grace period before restarting an inactive PTCP session
@@ -474,11 +474,14 @@ async fn run_server_once(
                     let last = *last_activity_watchdog.lock().unwrap();
                     let timeout = Duration::from_secs(watchdog_config.ptcp_inactivity_timeout_secs());
                     if last.elapsed() >= timeout {
-                        warn!("No PTCP activity for {:?}, requesting restart", timeout);
+                        warn!(
+                            "No PTCP activity for {:?}, requesting watchdog restart",
+                            timeout
+                        );
                         if let Some(flag) = &heartbeat_flag {
                             flag.store(false, Ordering::Relaxed);
                         }
-                        let _ = shutdown_tx_watchdog.send(ShutdownReason::Restart);
+                        let _ = shutdown_tx_watchdog.send(ShutdownReason::RestartWatchdog);
                         break;
                     }
                 }
@@ -649,7 +652,14 @@ async fn run_server_once(
     let realms: Vec<u32> = channels2.lock().unwrap().keys().copied().collect();
     for realm in realms {
         if dh_tx.send(PTCPEvent::Disconnect(realm)).await.is_err() {
-            warn!("Failed to enqueue disconnect for realm {:08x}", realm);
+            if shutdown_reason.is_ptcp_send_refused() {
+                debug!(
+                    "Skipping disconnect for realm {:08x}; PTCP writer already exited after ECONNREFUSED",
+                    realm
+                );
+            } else {
+                warn!("Failed to enqueue disconnect for realm {:08x}", realm);
+            }
         }
     }
 
@@ -671,13 +681,15 @@ async fn run_server_once(
 
     if let Some(lease) = relay_lease {
         if relay {
-            lease.release_with_socket(&relay_release_socket).await;
+            lease
+                .release_with_socket(&relay_release_socket, shutdown_reason)
+                .await;
         } else {
             lease.release().await;
         }
     }
 
-    if shutdown_reason == ShutdownReason::Restart {
+    if shutdown_reason.is_restart() {
         shutdown_handle.abort();
     } else {
         let _ = shutdown_handle.await;
