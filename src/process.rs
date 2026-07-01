@@ -22,6 +22,7 @@ use crate::transport::ptcp::{PTCPBody, PTCPEvent, PTCPPayload, PTCPSession, PTCP
 
 type RealmForwarders = Arc<Mutex<HashMap<u32, RealmForwarder>>>;
 static NEXT_REALM_FORWARDER_ID: AtomicU64 = AtomicU64::new(1);
+const PTCP_CURSOR_WRAP_LOG_WINDOW: u32 = 64 * 1024 * 1024;
 
 pub struct ResetBurstTracker {
     window: Duration,
@@ -773,6 +774,8 @@ pub async fn dh_reader(
         None
     };
     let mut last_late_dropped: u64 = 0;
+    let mut logged_cursor_near_wrap = false;
+    let mut logged_cursor_wrapped = false;
 
     // Create a tick interval for the buffer (runs every 10ms)
     let mut tick_interval = tokio::time::interval(Duration::from_millis(10));
@@ -799,6 +802,22 @@ pub async fn dh_reader(
                 };
 
                 let seq = packet.sent;
+                let body_len = packet.body_len();
+                let ack_cursor = packet.recv_after_body();
+                if !logged_cursor_near_wrap && seq >= u32::MAX - PTCP_CURSOR_WRAP_LOG_WINDOW {
+                    info!(
+                        "PTCP inbound byte cursor near u32 wrap: seq={} body_len={} ack_cursor={} wrap_window_bytes={}",
+                        seq, body_len, ack_cursor, PTCP_CURSOR_WRAP_LOG_WINDOW
+                    );
+                    logged_cursor_near_wrap = true;
+                }
+                if !logged_cursor_wrapped && body_len > 0 && ack_cursor < seq {
+                    warn!(
+                        "PTCP inbound byte cursor wrapped: seq={} body_len={} ack_cursor={}",
+                        seq, body_len, ack_cursor
+                    );
+                    logged_cursor_wrapped = true;
+                }
                 let packet = session.lock().unwrap().recv(packet);
                 {
                     let mut last = last_activity.lock().unwrap();

@@ -256,6 +256,14 @@ impl PTCPBody {
 }
 
 impl PTCPPacket {
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
+
+    pub fn recv_after_body(&self) -> u32 {
+        self.sent.wrapping_add(self.body.len() as u32)
+    }
+
     fn parse(data: &[u8]) -> Result<PTCPPacket, PTCPReadError> {
         if data.len() < 24 {
             return Err(PTCPReadError::Malformed(format!(
@@ -347,13 +355,13 @@ impl PTCPSession {
         let lmid = self.lmid();
         let rmid = self.rmid;
 
-        self.sent += body.len() as u32;
+        self.sent = self.sent.wrapping_add(body.len() as u32);
 
-        self.count += match body {
+        self.count = self.count.wrapping_add(match body {
             PTCPBody::Sync => 0,
             PTCPBody::Empty => 0,
             _ => 1,
-        };
+        });
 
         PTCPPacket {
             sent,
@@ -366,7 +374,7 @@ impl PTCPSession {
     }
 
     pub fn recv(&mut self, packet: PTCPPacket) -> PTCPPacket {
-        self.recv = packet.sent + packet.body.len() as u32;
+        self.recv = packet.recv_after_body();
         self.rmid = packet.lmid;
 
         packet
@@ -612,6 +620,34 @@ mod tests {
         let packet = session.send(PTCPBody::Heartbeat);
         assert_eq!(packet.sent, 12); // Second packet starts at 12
         assert_eq!(session.sent, 24); // After sending, sent = 24
+    }
+
+    #[test]
+    fn test_session_sent_wraps_like_u32_cursor() {
+        let mut session = PTCPSession::new();
+        session.sent = u32::MAX - 5;
+
+        let packet = session.send(PTCPBody::Heartbeat);
+
+        assert_eq!(packet.sent, u32::MAX - 5);
+        assert_eq!(session.sent, 6);
+    }
+
+    #[test]
+    fn test_session_recv_wraps_like_u32_cursor() {
+        let mut session = PTCPSession::new();
+        let packet = PTCPPacket {
+            sent: u32::MAX - 5,
+            recv: 0,
+            pid: 0,
+            lmid: 0,
+            rmid: 0,
+            body: PTCPBody::Heartbeat,
+        };
+
+        session.recv(packet);
+
+        assert_eq!(session.recv, 6);
     }
 
     #[test]
